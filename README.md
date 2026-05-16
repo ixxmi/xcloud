@@ -43,10 +43,32 @@ The server stores metadata in `server-data/metadata.json` and chunks under
 `server-data/chunks`.
 
 Open `http://127.0.0.1:8080/admin`, then log in or register a normal account
-from the same page. Reset each account's sync token before configuring clients.
-The token is shown only once.
+from the same page.
 
 ## Start Clients
+
+First start a client without a token:
+
+```sh
+./xcloud client -server http://127.0.0.1:8080
+```
+
+Open the local client console at `http://127.0.0.1:18080`, log in with the
+cloud account, then click `开启此账号同步`. This is an account-level cloud switch:
+when any logged-in client enables it, every other client already logged in to
+the same account detects the enabled state and starts syncing automatically. The
+client stores a device credential in `~/.xcloud/client-config.json`, reports
+local folders to the cloud gateway, and waits for folder selection in `/admin`.
+
+For explicit single-folder deployments, pass `-root` before logging in from the
+local client console:
+
+```sh
+mkdir -p /tmp/xcloud-a
+./xcloud client -root /tmp/xcloud-a -server http://127.0.0.1:8080
+```
+
+Legacy token-based startup is still supported for scripts and services.
 
 Terminal 1:
 

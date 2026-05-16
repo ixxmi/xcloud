@@ -3,6 +3,8 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -165,6 +167,14 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	enabled, err := s.accountSyncEnabled()
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		s.log.Info("account sync disabled; waiting for enable")
+		return nil
+	}
 	candidates, err := discoverRootFolders()
 	if err != nil {
 		return err
@@ -190,7 +200,8 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if s.state.DirReported(root) {
+		reportKey := s.reportedDirKey(root)
+		if s.state.DirReported(reportKey) {
 			continue
 		}
 		resp, err := s.api.ReportFolder(syncmodel.FolderReportRequest{
@@ -203,7 +214,7 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := s.state.MarkDirReported(root); err != nil {
+		if err := s.state.MarkDirReported(reportKey); err != nil {
 			return err
 		}
 		if !resp.Selected || resp.Space == nil {
@@ -226,7 +237,7 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := engine.SyncOnce(ctx); err != nil {
+		if err := engine.syncOnce(ctx); err != nil {
 			return err
 		}
 	}
@@ -236,6 +247,14 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 		s.log.Info("no selected folders yet; waiting for gateway selection", "candidates", len(candidates))
 	}
 	return nil
+}
+
+func (s *Supervisor) accountSyncEnabled() (bool, error) {
+	status, err := s.api.ClientStatus()
+	if err != nil {
+		return false, err
+	}
+	return status.SyncEnabled, nil
 }
 
 func (s *Supervisor) reportChildren(host string, req syncmodel.FolderDiscoveryRequest) error {
@@ -248,7 +267,8 @@ func (s *Supervisor) reportChildren(host string, req syncmodel.FolderDiscoveryRe
 		})
 	}
 	for _, child := range children {
-		if s.state.DirReported(child) {
+		reportKey := s.reportedDirKey(child)
+		if s.state.DirReported(reportKey) {
 			continue
 		}
 		if _, err := s.api.ReportFolder(syncmodel.FolderReportRequest{
@@ -261,7 +281,7 @@ func (s *Supervisor) reportChildren(host string, req syncmodel.FolderDiscoveryRe
 		}); err != nil {
 			return err
 		}
-		if err := s.state.MarkDirReported(child); err != nil {
+		if err := s.state.MarkDirReported(reportKey); err != nil {
 			return err
 		}
 		s.log.Info("reported child folder", "parent", req.RootPath, "root", child)
@@ -270,6 +290,12 @@ func (s *Supervisor) reportChildren(host string, req syncmodel.FolderDiscoveryRe
 		DeviceID: s.cfg.DeviceID,
 		RootPath: req.RootPath,
 	})
+}
+
+func (s *Supervisor) reportedDirKey(path string) string {
+	sum := sha256.Sum256([]byte(s.cfg.Token))
+	tokenPrefix := hex.EncodeToString(sum[:])[:12]
+	return s.cfg.ServerURL + "\x00" + s.cfg.DeviceID + "\x00" + tokenPrefix + "\x00" + path
 }
 
 func (s *Supervisor) engineFor(root, spaceID string) (*Engine, error) {
@@ -311,6 +337,26 @@ func (e *Engine) SyncOnce(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	enabled, err := e.accountSyncEnabled()
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		e.log.Info("account sync disabled; waiting for enable")
+		return nil
+	}
+	return e.syncOnce(ctx)
+}
+
+func (e *Engine) accountSyncEnabled() (bool, error) {
+	status, err := e.api.ClientStatus()
+	if err != nil {
+		return false, err
+	}
+	return status.SyncEnabled, nil
+}
+
+func (e *Engine) syncOnce(ctx context.Context) error {
 	selected, err := e.ensureFolderSelected()
 	if err != nil {
 		return err

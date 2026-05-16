@@ -57,6 +57,24 @@ func (a *API) ChildrenComplete(req syncmodel.FolderChildrenCompleteRequest) erro
 	return a.doJSON(http.MethodPost, "/v1/folders/children-complete", req, nil)
 }
 
+func (a *API) ClientLogin(req syncmodel.ClientLoginRequest) (syncmodel.ClientLoginResponse, error) {
+	var resp syncmodel.ClientLoginResponse
+	err := a.doJSON(http.MethodPost, "/v1/client/login", req, &resp)
+	return resp, err
+}
+
+func (a *API) ClientStatus() (syncmodel.ClientStatusResponse, error) {
+	var resp syncmodel.ClientStatusResponse
+	err := a.doJSON(http.MethodGet, "/v1/client/status", nil, &resp)
+	return resp, err
+}
+
+func (a *API) SetClientSyncEnabled(enabled bool) (syncmodel.ClientStatusResponse, error) {
+	var resp syncmodel.ClientStatusResponse
+	err := a.doJSON(http.MethodPost, "/v1/client/sync", syncmodel.ClientSyncToggleRequest{Enabled: enabled}, &resp)
+	return resp, err
+}
+
 func (a *API) ListFiles() ([]syncmodel.FileEntry, error) {
 	var resp syncmodel.ListResponse
 	if err := a.doJSON(http.MethodGet, "/v1/files", nil, &resp); err != nil {

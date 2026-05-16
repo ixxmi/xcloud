@@ -42,6 +42,7 @@ func NewStore(root string) (*Store, error) {
 		statePath: filepath.Join(root, "metadata.json"),
 		state: syncmodel.ServerState{
 			Accounts:      map[string]*syncmodel.Account{},
+			ClientTokens:  map[string]*syncmodel.ClientToken{},
 			Spaces:        map[string]*syncmodel.SyncSpace{},
 			ClientFolders: map[string]*syncmodel.ClientFolder{},
 			Files:         map[string]*syncmodel.FileEntry{},
@@ -77,6 +78,9 @@ func (s *Store) load() error {
 	}
 	if s.state.Accounts == nil {
 		s.state.Accounts = map[string]*syncmodel.Account{}
+	}
+	if s.state.ClientTokens == nil {
+		s.state.ClientTokens = map[string]*syncmodel.ClientToken{}
 	}
 	if s.state.Spaces == nil {
 		s.state.Spaces = map[string]*syncmodel.SyncSpace{}
@@ -270,6 +274,27 @@ func VerifySecret(secret, hash string) bool {
 func (s *Store) AuthenticateSyncToken(token string) (*syncmodel.Account, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	changed := false
+	for _, clientToken := range s.state.ClientTokens {
+		if clientToken.Disabled {
+			continue
+		}
+		if !VerifySecret(token, clientToken.TokenHash) {
+			continue
+		}
+		account := s.state.Accounts[clientToken.AccountID]
+		if account == nil || account.Disabled {
+			continue
+		}
+		clientToken.LastUsedAt = now
+		changed = true
+		copy := *account
+		if changed {
+			_ = s.saveLocked()
+		}
+		return &copy, true
+	}
 	for _, account := range s.state.Accounts {
 		if account.Disabled {
 			continue
@@ -280,6 +305,69 @@ func (s *Store) AuthenticateSyncToken(token string) (*syncmodel.Account, bool) {
 		}
 	}
 	return nil, false
+}
+
+func (s *Store) AccountForSyncToken(token string) (*syncmodel.Account, bool) {
+	return s.AuthenticateSyncToken(token)
+}
+
+func (s *Store) IssueClientToken(identifier, password, deviceID, hostname string) (syncmodel.Account, string, error) {
+	identifier = strings.ToLower(strings.TrimSpace(identifier))
+	deviceID = strings.TrimSpace(deviceID)
+	hostname = strings.TrimSpace(hostname)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var account *syncmodel.Account
+	for _, candidate := range s.state.Accounts {
+		if candidate.Disabled {
+			continue
+		}
+		username := strings.ToLower(candidate.Username)
+		email := strings.ToLower(candidate.Email)
+		if username != identifier && (email == "" || email != identifier) {
+			continue
+		}
+		if VerifySecret(password, candidate.PasswordHash) {
+			account = candidate
+			break
+		}
+	}
+	if account == nil {
+		return syncmodel.Account{}, "", errors.New("invalid account or password")
+	}
+	if s.state.ClientTokens == nil {
+		s.state.ClientTokens = map[string]*syncmodel.ClientToken{}
+	}
+	now := time.Now().Unix()
+	token := fileutil.NewID() + fileutil.NewID()
+	clientToken := &syncmodel.ClientToken{
+		ID:        fileutil.NewID(),
+		AccountID: account.ID,
+		DeviceID:  deviceID,
+		Hostname:  hostname,
+		TokenHash: HashSecret(token),
+		CreatedAt: now,
+	}
+	s.state.ClientTokens[clientToken.ID] = clientToken
+	if err := s.saveLocked(); err != nil {
+		return syncmodel.Account{}, "", err
+	}
+	copy := *account
+	copy.PasswordHash = ""
+	copy.SyncTokenHash = ""
+	return copy, token, nil
+}
+
+func (s *Store) SetAccountSyncEnabled(accountID string, enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.state.Accounts[accountID]
+	if account == nil || account.Disabled {
+		return errors.New("account not found")
+	}
+	account.SyncEnabled = enabled
+	account.UpdatedAt = time.Now().Unix()
+	return s.saveLocked()
 }
 
 func (s *Store) AuthenticatePassword(identifier, password string) (*syncmodel.Account, bool) {
@@ -611,6 +699,9 @@ func (s *Store) RequestChildren(accountID, folderID string) error {
 		if folder.AccountID != accountID || folder.ID != folderID {
 			continue
 		}
+		if folder.ChildrenReported {
+			return nil
+		}
 		now := time.Now().Unix()
 		folder.ChildrenRequested = true
 		folder.ChildrenReported = false
@@ -661,10 +752,13 @@ func (s *Store) SelectFolder(accountID, folderID, spaceID string) error {
 		}
 		folder.SpaceID = spaceID
 		folder.Status = syncmodel.FolderSelected
-		folder.ChildrenRequested = true
-		folder.ChildrenReported = false
-		folder.ChildrenRequestedAt = time.Now().Unix()
-		folder.UpdatedAt = time.Now().Unix()
+		now := time.Now().Unix()
+		if !folder.ChildrenReported {
+			folder.ChildrenRequested = true
+			folder.ChildrenReported = false
+			folder.ChildrenRequestedAt = now
+		}
+		folder.UpdatedAt = now
 		return s.saveLocked()
 	}
 	return errors.New("client folder not found")

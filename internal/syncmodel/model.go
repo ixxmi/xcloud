@@ -20,8 +20,28 @@ type Account struct {
 	SyncTokenHash string `json:"sync_token_hash"`
 	IsAdmin       bool   `json:"is_admin"`
 	Disabled      bool   `json:"disabled"`
+	SyncEnabled   bool   `json:"sync_enabled,omitempty"`
 	CreatedAt     int64  `json:"created_at"`
 	UpdatedAt     int64  `json:"updated_at"`
+}
+
+type AccountProfile struct {
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name,omitempty"`
+	Email       string `json:"email,omitempty"`
+	IsAdmin     bool   `json:"is_admin"`
+}
+
+type ClientToken struct {
+	ID         string `json:"id"`
+	AccountID  string `json:"account_id"`
+	DeviceID   string `json:"device_id,omitempty"`
+	Hostname   string `json:"hostname,omitempty"`
+	TokenHash  string `json:"token_hash"`
+	Disabled   bool   `json:"disabled,omitempty"`
+	CreatedAt  int64  `json:"created_at"`
+	LastUsedAt int64  `json:"last_used_at,omitempty"`
 }
 
 type SyncSpace struct {
@@ -103,6 +123,7 @@ type LocalFileState struct {
 
 type ServerState struct {
 	Accounts      map[string]*Account       `json:"accounts"`
+	ClientTokens  map[string]*ClientToken   `json:"client_tokens,omitempty"`
 	Spaces        map[string]*SyncSpace     `json:"spaces"`
 	ClientFolders map[string]*ClientFolder  `json:"client_folders"`
 	Files         map[string]*FileEntry     `json:"files"`
@@ -157,6 +178,30 @@ type FolderStatusResponse struct {
 type FolderChildrenCompleteRequest struct {
 	DeviceID string `json:"device_id"`
 	RootPath string `json:"root_path"`
+}
+
+type ClientLoginRequest struct {
+	Identifier string `json:"identifier"`
+	Password   string `json:"password"`
+	DeviceID   string `json:"device_id,omitempty"`
+	Hostname   string `json:"hostname,omitempty"`
+}
+
+type ClientLoginResponse struct {
+	Account     AccountProfile `json:"account"`
+	Token       string         `json:"token"`
+	SpaceID     string         `json:"space_id"`
+	SyncEnabled bool           `json:"sync_enabled"`
+}
+
+type ClientStatusResponse struct {
+	Account     AccountProfile `json:"account"`
+	SpaceID     string         `json:"space_id"`
+	SyncEnabled bool           `json:"sync_enabled"`
+}
+
+type ClientSyncToggleRequest struct {
+	Enabled bool `json:"enabled"`
 }
 
 type Manifest struct {

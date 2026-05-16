@@ -65,6 +65,8 @@ func runClient(args []string, log *slog.Logger) error {
 	root := fs.String("root", "", "directory to sync; when omitted, report discoverable local folders and sync selected ones")
 	serverURL := fs.String("server", "http://127.0.0.1:8080", "server URL")
 	token := fs.String("token", env("XCLOUD_TOKEN", ""), "account sync token; can also use XCLOUD_TOKEN")
+	clientAddr := fs.String("client-addr", "127.0.0.1:18080", "local client management console address when token is omitted")
+	clientConfig := fs.String("client-config", "", "local client config path; defaults to ~/.xcloud/client-config.json")
 	spaceID := fs.String("space", env("XCLOUD_SPACE", "default"), "suggested sync space ID for gateway selection; can also use XCLOUD_SPACE")
 	deviceID := fs.String("device", env("XCLOUD_DEVICE_ID", ""), "device ID; defaults to hostname")
 	statePath := fs.String("state", "", "client state file for single-root mode; defaults to <root>/.xcloud/state.json")
@@ -90,6 +92,26 @@ func runClient(args []string, log *slog.Logger) error {
 		DeleteRemote: *deleteRemote,
 		Log:          log,
 	}
+	if *token == "" {
+		console, err := client.NewConsole(client.ConsoleConfig{
+			Root:         *root,
+			ServerURL:    *serverURL,
+			ListenAddr:   *clientAddr,
+			ConfigPath:   *clientConfig,
+			StatePath:    *statePath,
+			SpaceID:      *spaceID,
+			DeviceID:     *deviceID,
+			Interval:     *interval,
+			ChunkSize:    *chunkSize,
+			DeleteRemote: *deleteRemote,
+			Log:          log,
+		})
+		if err != nil {
+			return err
+		}
+		log.Info("xcloud client console started", "addr", *clientAddr, "server", *serverURL)
+		return console.Run(ctx)
+	}
 	if *root == "" {
 		supervisor, err := client.NewSupervisor(cfg)
 		if err != nil {
@@ -111,7 +133,7 @@ func usage() {
 
 Usage:
   xcloud server -addr :8080 -data ./xcloud-data
-  xcloud client -server http://127.0.0.1:8080 -token account-token
+  xcloud client -server http://127.0.0.1:8080
   xcloud client -root ./docs -server http://127.0.0.1:8080 -token account-token -space default
 
 Commands:
