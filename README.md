@@ -59,6 +59,9 @@ when any logged-in client enables it, every other client already logged in to
 the same account detects the enabled state and starts syncing automatically. The
 client stores a device credential in `~/.xcloud/client-config.json`, reports
 local folders to the cloud gateway, and waits for folder selection in `/admin`.
+When `-root` is omitted, the default reported and synced folder is `xcloud`
+under the client's process working directory. The management console can later
+change the local placement path for a reported client folder.
 
 For explicit single-folder deployments, pass `-root` before logging in from the
 local client console:
@@ -100,11 +103,17 @@ For a single sync cycle:
 `-space` is a suggested Space for the folder report. The effective Space is the
 one selected by the gateway in the management console.
 
-`-root` is optional. Without it, the client first reports only top-level roots
-such as the current working directory and the user's home directory. In the
-console, use `展开下一级` to ask the client to report the next level. Already
-reported folders are cached locally and are not reported repeatedly. With
-`-root`, the client runs in compatibility mode for one explicit folder.
+`-root` is optional. Without it, the client uses `<process working directory>/xcloud`
+as the default sync folder, creates it if needed, and reports it to the gateway.
+In the console, use `展开下一级` to ask the client to report the next level.
+Already reported folders are cached locally and are not reported repeatedly.
+With `-root`, the client runs in compatibility mode for one explicit folder.
+
+The server stores account-level sync trigger settings. By default clients use
+filesystem watching for near real-time sync plus a periodic scan fallback. The
+management console can configure realtime on/off, debounce milliseconds, and
+fallback scan interval seconds. Sync results are recorded per file operation and
+shown in the `同步记录` view.
 
 Local deletes are conservative by default. To propagate local deletes to the
 server, run the client with:

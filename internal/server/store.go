@@ -121,6 +121,7 @@ func (s *Store) ensureBootstrap() error {
 			PasswordHash:  HashSecret(defaultAdminPass),
 			SyncTokenHash: HashSecret(fileutil.NewID()),
 			IsAdmin:       true,
+			SyncSettings:  syncmodel.DefaultSyncSettings(),
 			CreatedAt:     now,
 			UpdatedAt:     now,
 		}
@@ -173,6 +174,14 @@ func (s *Store) ensureBootstrap() error {
 func (s *Store) normalizeAccountsLocked() bool {
 	changed := false
 	for _, account := range s.state.Accounts {
+		normalizedSettings := syncmodel.NormalizeSyncSettings(account.SyncSettings)
+		if !account.SyncSettings.RealtimeEnabled && account.SyncSettings.DebounceMillis == 0 && account.SyncSettings.IntervalSeconds == 0 {
+			normalizedSettings = syncmodel.DefaultSyncSettings()
+		}
+		if account.SyncSettings != normalizedSettings {
+			account.SyncSettings = normalizedSettings
+			changed = true
+		}
 		if account.DisplayName == "" {
 			account.DisplayName = account.Username
 			changed = true
@@ -195,6 +204,10 @@ func (s *Store) normalizeFoldersLocked() bool {
 		}
 		if folder.Depth < 0 {
 			folder.Depth = 0
+			changed = true
+		}
+		if folder.LocalPath == "" {
+			folder.LocalPath = folder.RootPath
 			changed = true
 		}
 	}
@@ -370,6 +383,18 @@ func (s *Store) SetAccountSyncEnabled(accountID string, enabled bool) error {
 	return s.saveLocked()
 }
 
+func (s *Store) SetSyncSettings(accountID string, settings syncmodel.SyncSettings) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.state.Accounts[accountID]
+	if account == nil || account.Disabled {
+		return errors.New("account not found")
+	}
+	account.SyncSettings = syncmodel.NormalizeSyncSettings(settings)
+	account.UpdatedAt = time.Now().Unix()
+	return s.saveLocked()
+}
+
 func (s *Store) AuthenticatePassword(identifier, password string) (*syncmodel.Account, bool) {
 	identifier = strings.ToLower(strings.TrimSpace(identifier))
 	s.mu.Lock()
@@ -473,6 +498,7 @@ func (s *Store) CreateAccount(username, email, displayName, password string, adm
 		PasswordHash:  HashSecret(password),
 		SyncTokenHash: HashSecret(token),
 		IsAdmin:       admin,
+		SyncSettings:  syncmodel.DefaultSyncSettings(),
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
@@ -605,6 +631,7 @@ func (s *Store) ReportFolder(accountID string, req syncmodel.FolderReportRequest
 			DeviceID:         deviceID,
 			Hostname:         hostname,
 			RootPath:         rootPath,
+			LocalPath:        rootPath,
 			ParentPath:       parentPath,
 			Depth:            depth,
 			SuggestedSpaceID: suggestedSpaceID,
@@ -662,7 +689,10 @@ func (s *Store) ListFolders(accountID string) []syncmodel.ClientFolder {
 func (s *Store) FolderStatus(accountID, deviceID string) syncmodel.FolderStatusResponse {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	resp := syncmodel.FolderStatusResponse{}
+	resp := syncmodel.FolderStatusResponse{Settings: syncmodel.DefaultSyncSettings()}
+	if account := s.state.Accounts[accountID]; account != nil {
+		resp.Settings = syncmodel.NormalizeSyncSettings(account.SyncSettings)
+	}
 	for _, folder := range s.state.ClientFolders {
 		if folder.AccountID != accountID {
 			continue
@@ -683,6 +713,37 @@ func (s *Store) FolderStatus(accountID, deviceID string) syncmodel.FolderStatusR
 	sort.Slice(resp.Requests, func(i, j int) bool {
 		return resp.Requests[i].RootPath < resp.Requests[j].RootPath
 	})
+	sort.Slice(resp.Selected, func(i, j int) bool {
+		return resp.Selected[i].RootPath < resp.Selected[j].RootPath
+	})
+	return resp
+}
+
+func (s *Store) ClientStatus(accountID, deviceID string) syncmodel.ClientStatusResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.state.Accounts[accountID]
+	resp := syncmodel.ClientStatusResponse{
+		SpaceID:  "default",
+		Settings: syncmodel.DefaultSyncSettings(),
+	}
+	if account == nil {
+		return resp
+	}
+	resp.Account = accountProfile(*account)
+	resp.SyncEnabled = account.SyncEnabled
+	resp.Settings = syncmodel.NormalizeSyncSettings(account.SyncSettings)
+	for _, folder := range s.state.ClientFolders {
+		if folder.AccountID != accountID {
+			continue
+		}
+		if deviceID != "" && folder.DeviceID != deviceID {
+			continue
+		}
+		if folder.Status == syncmodel.FolderSelected && folder.SpaceID != "" {
+			resp.Selected = append(resp.Selected, *folder)
+		}
+	}
 	sort.Slice(resp.Selected, func(i, j int) bool {
 		return resp.Selected[i].RootPath < resp.Selected[j].RootPath
 	})
@@ -762,6 +823,56 @@ func (s *Store) SelectFolder(accountID, folderID, spaceID string) error {
 		return s.saveLocked()
 	}
 	return errors.New("client folder not found")
+}
+
+func (s *Store) SetFolderLocalPath(accountID, folderID, localPath string) error {
+	if folderID == "" {
+		return errors.New("folder_id is required")
+	}
+	localPath = strings.TrimSpace(localPath)
+	if localPath == "" {
+		return errors.New("local path is required")
+	}
+	if !isClientAbsolutePath(localPath) {
+		return errors.New("local path must be absolute")
+	}
+	cleanPath := cleanClientPath(localPath)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, folder := range s.state.ClientFolders {
+		if folder.AccountID != accountID || folder.ID != folderID {
+			continue
+		}
+		folder.LocalPath = cleanPath
+		folder.UpdatedAt = time.Now().Unix()
+		return s.saveLocked()
+	}
+	return errors.New("client folder not found")
+}
+
+func isClientAbsolutePath(path string) bool {
+	if filepath.IsAbs(path) || strings.HasPrefix(path, "/") {
+		return true
+	}
+	if strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, `//`) {
+		return true
+	}
+	if len(path) >= 3 {
+		drive := path[0]
+		return ((drive >= 'a' && drive <= 'z') || (drive >= 'A' && drive <= 'Z')) && path[1] == ':' && (path[2] == '\\' || path[2] == '/')
+	}
+	return false
+}
+
+func cleanClientPath(path string) string {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	path = strings.ReplaceAll(path, "/", `\`)
+	for strings.Contains(path, `\\\`) {
+		path = strings.ReplaceAll(path, `\\\`, `\\`)
+	}
+	return path
 }
 
 func (s *Store) DisableFolder(accountID, folderID string) error {
@@ -1115,6 +1226,72 @@ func (s *Store) Delete(accountID, spaceID string, req syncmodel.DeleteRequest) (
 		return syncmodel.CommitResponse{}, err
 	}
 	return resp, nil
+}
+
+func (s *Store) AddSyncRecord(accountID string, req syncmodel.SyncRecordRequest) (syncmodel.SyncRecord, error) {
+	action := strings.TrimSpace(req.Action)
+	status := strings.TrimSpace(req.Status)
+	if action == "" {
+		return syncmodel.SyncRecord{}, errors.New("action is required")
+	}
+	if status == "" {
+		return syncmodel.SyncRecord{}, errors.New("status is required")
+	}
+	if status != syncmodel.SyncRecordStatusSuccess && status != syncmodel.SyncRecordStatusFailed {
+		return syncmodel.SyncRecord{}, errors.New("invalid sync record status")
+	}
+	now := time.Now().Unix()
+	record := syncmodel.SyncRecord{
+		ID:             fileutil.NewID(),
+		AccountID:      accountID,
+		SpaceID:        strings.TrimSpace(req.SpaceID),
+		DeviceID:       strings.TrimSpace(req.DeviceID),
+		RootPath:       strings.TrimSpace(req.RootPath),
+		Path:           strings.TrimSpace(req.Path),
+		Action:         action,
+		Status:         status,
+		Error:          strings.TrimSpace(req.Error),
+		DurationMillis: req.DurationMillis,
+		CreatedAt:      now,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.SyncRecords = append(s.state.SyncRecords, record)
+	s.trimSyncRecordsLocked(accountID)
+	if err := s.saveLocked(); err != nil {
+		return syncmodel.SyncRecord{}, err
+	}
+	return record, nil
+}
+
+func (s *Store) ListSyncRecords(accountID string, limit int) []syncmodel.SyncRecord {
+	if limit <= 0 {
+		limit = 200
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]syncmodel.SyncRecord, 0, limit)
+	for i := len(s.state.SyncRecords) - 1; i >= 0 && len(out) < limit; i-- {
+		record := s.state.SyncRecords[i]
+		if record.AccountID == accountID {
+			out = append(out, record)
+		}
+	}
+	return out
+}
+
+func (s *Store) trimSyncRecordsLocked(accountID string) {
+	count := 0
+	for i := len(s.state.SyncRecords) - 1; i >= 0; i-- {
+		if s.state.SyncRecords[i].AccountID != accountID {
+			continue
+		}
+		count++
+		if count <= syncmodel.MaxSyncRecordsPerAccount {
+			continue
+		}
+		s.state.SyncRecords = append(s.state.SyncRecords[:i], s.state.SyncRecords[i+1:]...)
+	}
 }
 
 func (s *Store) verifyManifest(accountID string, manifest syncmodel.Manifest) error {

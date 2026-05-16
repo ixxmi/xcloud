@@ -1,7 +1,10 @@
 package syncmodel
 
 const (
-	DefaultChunkSize = 4 * 1024 * 1024
+	DefaultChunkSize           = 4 * 1024 * 1024
+	DefaultSyncIntervalSeconds = 10
+	DefaultSyncDebounceMillis  = 800
+	MaxSyncRecordsPerAccount   = 5000
 
 	EntryFile    = "file"
 	EntryDeleted = "deleted"
@@ -9,20 +12,61 @@ const (
 	FolderPending  = "pending"
 	FolderSelected = "selected"
 	FolderDisabled = "disabled"
+
+	SyncActionUpload        = "upload"
+	SyncActionDownload      = "download"
+	SyncActionDelete        = "delete"
+	SyncActionConflict      = "conflict"
+	SyncActionSkip          = "skip"
+	SyncActionScan          = "scan"
+	SyncActionWatch         = "watch"
+	SyncRecordStatusSuccess = "success"
+	SyncRecordStatusFailed  = "failed"
 )
 
 type Account struct {
-	ID            string `json:"id"`
-	Username      string `json:"username"`
-	DisplayName   string `json:"display_name,omitempty"`
-	Email         string `json:"email,omitempty"`
-	PasswordHash  string `json:"password_hash"`
-	SyncTokenHash string `json:"sync_token_hash"`
-	IsAdmin       bool   `json:"is_admin"`
-	Disabled      bool   `json:"disabled"`
-	SyncEnabled   bool   `json:"sync_enabled,omitempty"`
-	CreatedAt     int64  `json:"created_at"`
-	UpdatedAt     int64  `json:"updated_at"`
+	ID            string       `json:"id"`
+	Username      string       `json:"username"`
+	DisplayName   string       `json:"display_name,omitempty"`
+	Email         string       `json:"email,omitempty"`
+	PasswordHash  string       `json:"password_hash"`
+	SyncTokenHash string       `json:"sync_token_hash"`
+	IsAdmin       bool         `json:"is_admin"`
+	Disabled      bool         `json:"disabled"`
+	SyncEnabled   bool         `json:"sync_enabled,omitempty"`
+	SyncSettings  SyncSettings `json:"sync_settings"`
+	CreatedAt     int64        `json:"created_at"`
+	UpdatedAt     int64        `json:"updated_at"`
+}
+
+type SyncSettings struct {
+	RealtimeEnabled bool `json:"realtime_enabled"`
+	DebounceMillis  int  `json:"debounce_millis"`
+	IntervalSeconds int  `json:"interval_seconds"`
+}
+
+func DefaultSyncSettings() SyncSettings {
+	return SyncSettings{
+		RealtimeEnabled: true,
+		DebounceMillis:  DefaultSyncDebounceMillis,
+		IntervalSeconds: DefaultSyncIntervalSeconds,
+	}
+}
+
+func NormalizeSyncSettings(settings SyncSettings) SyncSettings {
+	if settings.DebounceMillis <= 0 {
+		settings.DebounceMillis = DefaultSyncDebounceMillis
+	}
+	if settings.IntervalSeconds <= 0 {
+		settings.IntervalSeconds = DefaultSyncIntervalSeconds
+	}
+	if settings.IntervalSeconds < 1 {
+		settings.IntervalSeconds = 1
+	}
+	if settings.DebounceMillis < 100 {
+		settings.DebounceMillis = 100
+	}
+	return settings
 }
 
 type AccountProfile struct {
@@ -60,6 +104,7 @@ type ClientFolder struct {
 	DeviceID            string `json:"device_id"`
 	Hostname            string `json:"hostname,omitempty"`
 	RootPath            string `json:"root_path"`
+	LocalPath           string `json:"local_path,omitempty"`
 	ParentPath          string `json:"parent_path,omitempty"`
 	Depth               int    `json:"depth"`
 	SuggestedSpaceID    string `json:"suggested_space_id,omitempty"`
@@ -134,6 +179,21 @@ type ServerState struct {
 	Operations    map[string]CommitResponse `json:"operations"`
 	LastEventSeq  int64                     `json:"last_event_seq"`
 	Events        []Event                   `json:"events"`
+	SyncRecords   []SyncRecord              `json:"sync_records,omitempty"`
+}
+
+type SyncRecord struct {
+	ID             string `json:"id"`
+	AccountID      string `json:"account_id,omitempty"`
+	SpaceID        string `json:"space_id,omitempty"`
+	DeviceID       string `json:"device_id,omitempty"`
+	RootPath       string `json:"root_path,omitempty"`
+	Path           string `json:"path,omitempty"`
+	Action         string `json:"action"`
+	Status         string `json:"status"`
+	Error          string `json:"error,omitempty"`
+	DurationMillis int64  `json:"duration_millis,omitempty"`
+	CreatedAt      int64  `json:"created_at"`
 }
 
 type Event struct {
@@ -173,6 +233,7 @@ type FolderReportResponse struct {
 type FolderStatusResponse struct {
 	Requests []FolderDiscoveryRequest `json:"requests"`
 	Selected []ClientFolder           `json:"selected"`
+	Settings SyncSettings             `json:"settings"`
 }
 
 type FolderChildrenCompleteRequest struct {
@@ -192,16 +253,43 @@ type ClientLoginResponse struct {
 	Token       string         `json:"token"`
 	SpaceID     string         `json:"space_id"`
 	SyncEnabled bool           `json:"sync_enabled"`
+	Settings    SyncSettings   `json:"settings"`
 }
 
 type ClientStatusResponse struct {
 	Account     AccountProfile `json:"account"`
 	SpaceID     string         `json:"space_id"`
 	SyncEnabled bool           `json:"sync_enabled"`
+	Settings    SyncSettings   `json:"settings"`
+	Selected    []ClientFolder `json:"selected,omitempty"`
 }
 
 type ClientSyncToggleRequest struct {
 	Enabled bool `json:"enabled"`
+}
+
+type SyncSettingsUpdateRequest struct {
+	AccountID       string `json:"account_id,omitempty"`
+	RealtimeEnabled bool   `json:"realtime_enabled"`
+	DebounceMillis  int    `json:"debounce_millis"`
+	IntervalSeconds int    `json:"interval_seconds"`
+}
+
+type FolderLocalPathRequest struct {
+	AccountID string `json:"account_id,omitempty"`
+	FolderID  string `json:"folder_id"`
+	LocalPath string `json:"local_path"`
+}
+
+type SyncRecordRequest struct {
+	SpaceID        string `json:"space_id,omitempty"`
+	DeviceID       string `json:"device_id,omitempty"`
+	RootPath       string `json:"root_path,omitempty"`
+	Path           string `json:"path,omitempty"`
+	Action         string `json:"action"`
+	Status         string `json:"status"`
+	Error          string `json:"error,omitempty"`
+	DurationMillis int64  `json:"duration_millis,omitempty"`
 }
 
 type Manifest struct {

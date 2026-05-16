@@ -83,6 +83,7 @@ func NewConsole(cfg ConsoleConfig) (*Console, error) {
 	if local.DeviceID == "" {
 		local.DeviceID = cfg.DeviceID
 	}
+	local.SyncSettings = syncmodel.NormalizeSyncSettings(local.SyncSettings)
 	local.DeleteRemote = local.DeleteRemote || cfg.DeleteRemote
 	return &Console{cfg: cfg, log: cfg.Log, local: local}, nil
 }
@@ -163,6 +164,7 @@ func (c *Console) handleLogin(w http.ResponseWriter, r *http.Request) {
 	c.local.Username = resp.Account.Username
 	c.local.DisplayName = resp.Account.DisplayName
 	c.local.SyncEnabled = resp.SyncEnabled
+	c.local.SyncSettings = syncmodel.NormalizeSyncSettings(resp.Settings)
 	c.local.DeleteRemote = c.cfg.DeleteRemote
 	err = SaveLocalConfig(c.cfg.ConfigPath, c.local)
 	if err == nil && c.local.SyncEnabled {
@@ -191,6 +193,7 @@ func (c *Console) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.local.SyncEnabled = status.SyncEnabled
+	c.local.SyncSettings = syncmodel.NormalizeSyncSettings(status.Settings)
 	if err := SaveLocalConfig(c.cfg.ConfigPath, c.local); err != nil {
 		c.mu.Unlock()
 		c.renderWithMessage(w, "error", err.Error())
@@ -294,6 +297,7 @@ func (c *Console) refreshCloudSync(ctx context.Context) {
 	}
 	c.mu.Lock()
 	c.local.SyncEnabled = status.SyncEnabled
+	c.local.SyncSettings = syncmodel.NormalizeSyncSettings(status.Settings)
 	c.local.SpaceID = status.SpaceID
 	c.local.Username = status.Account.Username
 	c.local.DisplayName = status.Account.DisplayName
@@ -328,6 +332,7 @@ func (c *Console) startSyncLocked() {
 		DeviceID:     c.local.DeviceID,
 		StatePath:    c.cfg.StatePath,
 		Interval:     c.cfg.Interval,
+		Settings:     syncmodel.NormalizeSyncSettings(c.local.SyncSettings),
 		ChunkSize:    c.cfg.ChunkSize,
 		DeleteRemote: c.local.DeleteRemote,
 		Log:          c.log,

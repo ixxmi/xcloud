@@ -13,7 +13,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 
 	"xcloud/internal/fileutil"
 	"xcloud/internal/syncmodel"
@@ -21,12 +24,14 @@ import (
 
 type Config struct {
 	Root         string
+	LocalRoot    string
 	StatePath    string
 	ServerURL    string
 	Token        string
 	SpaceID      string
 	DeviceID     string
 	Interval     time.Duration
+	Settings     syncmodel.SyncSettings
 	ChunkSize    int
 	Once         bool
 	DeleteRemote bool
@@ -34,18 +39,22 @@ type Config struct {
 }
 
 type Engine struct {
-	cfg   Config
-	api   *API
-	state *State
-	log   *slog.Logger
-}
-
-type Supervisor struct {
 	cfg     Config
 	api     *API
 	state   *State
-	engines map[string]*Engine
 	log     *slog.Logger
+	mu      sync.Mutex
+	running bool
+}
+
+type Supervisor struct {
+	cfg           Config
+	api           *API
+	state         *State
+	engines       map[string]*Engine
+	engineStarted map[string]bool
+	log           *slog.Logger
+	mu            sync.Mutex
 }
 
 type localScanEntry struct {
@@ -56,6 +65,8 @@ type localScanEntry struct {
 	Hash        string
 	Chunks      []syncmodel.ChunkRef
 }
+
+var errWatchRootChanged = errors.New("watch root changed")
 
 func NewEngine(cfg Config) (*Engine, error) {
 	if cfg.ServerURL == "" {
@@ -77,6 +88,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 10 * time.Second
 	}
+	cfg.Settings = normalizeClientSettings(cfg.Settings, cfg.Interval)
 	if cfg.ChunkSize <= 0 {
 		cfg.ChunkSize = syncmodel.DefaultChunkSize
 	}
@@ -88,8 +100,19 @@ func NewEngine(cfg Config) (*Engine, error) {
 		return nil, err
 	}
 	cfg.Root = rootAbs
+	if cfg.LocalRoot == "" {
+		cfg.LocalRoot = cfg.Root
+	}
+	localRootAbs, err := filepath.Abs(cfg.LocalRoot)
+	if err != nil {
+		return nil, err
+	}
+	cfg.LocalRoot = localRootAbs
+	if err := os.MkdirAll(cfg.LocalRoot, 0o755); err != nil {
+		return nil, err
+	}
 	if cfg.StatePath == "" {
-		cfg.StatePath = filepath.Join(cfg.Root, ".xcloud", "state.json")
+		cfg.StatePath = filepath.Join(cfg.LocalRoot, ".xcloud", "state.json")
 	}
 	state, err := OpenState(cfg.StatePath)
 	if err != nil {
@@ -123,11 +146,25 @@ func NewSupervisor(cfg Config) (*Supervisor, error) {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 10 * time.Second
 	}
+	cfg.Settings = normalizeClientSettings(cfg.Settings, cfg.Interval)
 	if cfg.ChunkSize <= 0 {
 		cfg.ChunkSize = syncmodel.DefaultChunkSize
 	}
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
+	}
+	if cfg.Root == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+		cfg.Root = filepath.Join(cwd, "xcloud")
+	}
+	if cfg.LocalRoot == "" {
+		cfg.LocalRoot = cfg.Root
+	}
+	if err := os.MkdirAll(cfg.LocalRoot, 0o755); err != nil {
+		return nil, err
 	}
 	if cfg.StatePath == "" {
 		cfg.StatePath = filepath.Join(clientStateRoot(), ".xcloud", "discovery-state.json")
@@ -137,12 +174,31 @@ func NewSupervisor(cfg Config) (*Supervisor, error) {
 		return nil, err
 	}
 	return &Supervisor{
-		cfg:     cfg,
-		api:     NewAPI(cfg.ServerURL, cfg.Token, cfg.SpaceID, cfg.DeviceID, ""),
-		state:   state,
-		engines: map[string]*Engine{},
-		log:     cfg.Log,
+		cfg:           cfg,
+		api:           NewAPI(cfg.ServerURL, cfg.Token, cfg.SpaceID, cfg.DeviceID, ""),
+		state:         state,
+		engines:       map[string]*Engine{},
+		engineStarted: map[string]bool{},
+		log:           cfg.Log,
 	}, nil
+}
+
+func normalizeClientSettings(settings syncmodel.SyncSettings, fallbackInterval time.Duration) syncmodel.SyncSettings {
+	if settings.IntervalSeconds <= 0 && fallbackInterval > 0 {
+		settings.IntervalSeconds = int(fallbackInterval.Seconds())
+	}
+	if settings.IntervalSeconds <= 0 {
+		settings.IntervalSeconds = syncmodel.DefaultSyncIntervalSeconds
+	}
+	if settings.DebounceMillis <= 0 {
+		settings.DebounceMillis = syncmodel.DefaultSyncDebounceMillis
+	}
+	return syncmodel.NormalizeSyncSettings(settings)
+}
+
+func applySettingsToConfig(cfg *Config, settings syncmodel.SyncSettings) {
+	cfg.Settings = normalizeClientSettings(settings, cfg.Interval)
+	cfg.Interval = time.Duration(cfg.Settings.IntervalSeconds) * time.Second
 }
 
 func (s *Supervisor) Run(ctx context.Context) error {
@@ -155,6 +211,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if err := s.SyncOnce(ctx); err != nil {
 			s.log.Error("sync failed", "err", err)
 		}
+		ticker.Reset(s.cfg.Interval)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -169,21 +226,21 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 	}
 	enabled, err := s.accountSyncEnabled()
 	if err != nil {
+		s.reportRecord(syncmodel.SyncActionScan, syncmodel.SyncRecordStatusFailed, "", err, 0)
 		return err
 	}
 	if !enabled {
 		s.log.Info("account sync disabled; waiting for enable")
 		return nil
 	}
-	candidates, err := discoverRootFolders()
-	if err != nil {
-		return err
-	}
+	candidates := []string{s.cfg.Root}
 	host, _ := os.Hostname()
 	status, err := s.api.FolderStatus()
 	if err != nil {
+		s.reportRecord(syncmodel.SyncActionScan, syncmodel.SyncRecordStatusFailed, "", err, 0)
 		return err
 	}
+	applySettingsToConfig(&s.cfg, status.Settings)
 	for _, req := range status.Requests {
 		if err := s.reportChildren(host, req); err != nil {
 			return err
@@ -237,9 +294,13 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := engine.syncOnce(ctx); err != nil {
-			return err
+		if s.cfg.Once {
+			if err := engine.syncOnce(ctx); err != nil {
+				return err
+			}
+			continue
 		}
+		s.startEngine(ctx, folder.RootPath, folder.SpaceID, engine)
 	}
 	if len(candidates) == 0 {
 		s.log.Info("no local folders discovered for reporting")
@@ -300,31 +361,80 @@ func (s *Supervisor) reportedDirKey(path string) string {
 
 func (s *Supervisor) engineFor(root, spaceID string) (*Engine, error) {
 	key := root + "\x00" + spaceID
+	s.mu.Lock()
 	if engine := s.engines[key]; engine != nil {
+		s.mu.Unlock()
 		return engine, nil
 	}
+	s.mu.Unlock()
 	cfg := s.cfg
 	cfg.Root = root
+	cfg.LocalRoot = root
 	cfg.SpaceID = spaceID
-	cfg.StatePath = filepath.Join(root, ".xcloud", "state-"+safeStateName(spaceID)+".json")
+	cfg.StatePath = filepath.Join(cfg.LocalRoot, ".xcloud", "state-"+safeStateName(spaceID)+".json")
 	engine, err := NewEngine(cfg)
 	if err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
 	s.engines[key] = engine
+	s.mu.Unlock()
 	return engine, nil
+}
+
+func (s *Supervisor) startEngine(ctx context.Context, root, spaceID string, engine *Engine) {
+	key := root + "\x00" + spaceID
+	s.mu.Lock()
+	if s.engineStarted[key] {
+		s.mu.Unlock()
+		return
+	}
+	s.engineStarted[key] = true
+	s.mu.Unlock()
+	go func() {
+		err := engine.Run(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			s.log.Error("selected folder sync stopped", "root", root, "space", spaceID, "err", err)
+		}
+		s.mu.Lock()
+		delete(s.engineStarted, key)
+		s.mu.Unlock()
+	}()
+}
+
+func (s *Supervisor) reportRecord(action, status, path string, err error, duration time.Duration) {
+	req := syncmodel.SyncRecordRequest{
+		SpaceID:        s.cfg.SpaceID,
+		DeviceID:       s.cfg.DeviceID,
+		Path:           path,
+		Action:         action,
+		Status:         status,
+		DurationMillis: duration.Milliseconds(),
+	}
+	if err != nil {
+		req.Error = err.Error()
+	}
+	_ = s.api.ReportSyncRecord(req)
 }
 
 func (e *Engine) Run(ctx context.Context) error {
 	if e.cfg.Once {
 		return e.SyncOnce(ctx)
 	}
+	if e.cfg.Settings.RealtimeEnabled {
+		return e.runRealtime(ctx)
+	}
+	return e.runInterval(ctx)
+}
+
+func (e *Engine) runInterval(ctx context.Context) error {
 	ticker := time.NewTicker(e.cfg.Interval)
 	defer ticker.Stop()
 	for {
 		if err := e.SyncOnce(ctx); err != nil {
 			e.log.Error("sync failed", "err", err)
 		}
+		ticker.Reset(e.cfg.Interval)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -333,10 +443,125 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 }
 
+func (e *Engine) runRealtime(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := e.runRealtimeWatch(ctx)
+		if errors.Is(err, errWatchRootChanged) {
+			continue
+		}
+		return err
+	}
+}
+
+func (e *Engine) runRealtimeWatch(ctx context.Context) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		e.reportRecord(syncmodel.SyncActionWatch, syncmodel.SyncRecordStatusFailed, "", err, 0)
+		return e.runInterval(ctx)
+	}
+	defer watcher.Close()
+	watchedRoot := e.cfg.LocalRoot
+	if err := e.watchTree(watcher); err != nil {
+		e.reportRecord(syncmodel.SyncActionWatch, syncmodel.SyncRecordStatusFailed, "", err, 0)
+		e.log.Warn("filesystem watch failed; falling back to interval sync", "root", e.cfg.LocalRoot, "err", err)
+		return e.runInterval(ctx)
+	}
+	trigger := make(chan struct{}, 1)
+	triggerSync := func() {
+		select {
+		case trigger <- struct{}{}:
+		default:
+		}
+	}
+	triggerSync()
+	ticker := time.NewTicker(e.cfg.Interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return ctx.Err()
+			}
+			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) != 0 {
+				if info, statErr := os.Stat(event.Name); statErr == nil && info.IsDir() {
+					_ = filepath.WalkDir(event.Name, func(path string, d os.DirEntry, walkErr error) error {
+						if walkErr != nil || !d.IsDir() || shouldSkipDiscoveredDir(d.Name()) {
+							return nil
+						}
+						_ = watcher.Add(path)
+						return nil
+					})
+				}
+				triggerSync()
+			}
+		case err, ok := <-watcher.Errors:
+			if ok && err != nil {
+				e.reportRecord(syncmodel.SyncActionWatch, syncmodel.SyncRecordStatusFailed, "", err, 0)
+				e.log.Warn("filesystem watch error", "root", e.cfg.LocalRoot, "err", err)
+			}
+		case <-ticker.C:
+			triggerSync()
+			ticker.Reset(e.cfg.Interval)
+		case <-trigger:
+			debounce := time.Duration(e.cfg.Settings.DebounceMillis) * time.Millisecond
+			timer := time.NewTimer(debounce)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			if err := e.SyncOnce(ctx); err != nil {
+				e.log.Error("sync failed", "err", err)
+			}
+			if e.cfg.LocalRoot != watchedRoot {
+				return errWatchRootChanged
+			}
+		}
+	}
+}
+
+func (e *Engine) watchTree(watcher *fsnotify.Watcher) error {
+	return filepath.WalkDir(e.cfg.LocalRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(e.cfg.LocalRoot, path)
+		if relErr != nil {
+			return relErr
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == ".xcloud" || strings.HasPrefix(rel, ".xcloud/") || shouldSkipDiscoveredDir(d.Name()) {
+			if path != e.cfg.LocalRoot {
+				return filepath.SkipDir
+			}
+		}
+		return watcher.Add(path)
+	})
+}
+
 func (e *Engine) SyncOnce(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	e.mu.Lock()
+	if e.running {
+		e.mu.Unlock()
+		return nil
+	}
+	e.running = true
+	defer func() {
+		e.running = false
+		e.mu.Unlock()
+	}()
 	enabled, err := e.accountSyncEnabled()
 	if err != nil {
 		return err
@@ -353,7 +578,38 @@ func (e *Engine) accountSyncEnabled() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	applySettingsToConfig(&e.cfg, status.Settings)
+	for _, folder := range status.Selected {
+		if folder.RootPath == e.cfg.Root && folder.LocalPath != "" && folder.LocalPath != e.cfg.LocalRoot {
+			if err := e.switchRoot(folder.LocalPath); err != nil {
+				return false, err
+			}
+			break
+		}
+	}
 	return status.SyncEnabled, nil
+}
+
+func (e *Engine) switchRoot(root string) error {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(rootAbs, 0o755); err != nil {
+		return err
+	}
+	e.cfg.LocalRoot = rootAbs
+	e.cfg.StatePath = filepath.Join(rootAbs, ".xcloud", "state-"+safeStateName(e.cfg.SpaceID)+".json")
+	state, err := OpenState(e.cfg.StatePath)
+	if err != nil {
+		return err
+	}
+	if err := state.SeedSpace(e.cfg.SpaceID); err != nil {
+		return err
+	}
+	e.state = state
+	e.api.SetSyncContext(e.cfg.SpaceID, e.cfg.DeviceID, e.cfg.Root)
+	return nil
 }
 
 func (e *Engine) syncOnce(ctx context.Context) error {
@@ -443,6 +699,7 @@ func (e *Engine) pushLocal(ctx context.Context) error {
 			continue
 		}
 		e.log.Info("delete remote tombstone", "path", rel)
+		started := time.Now()
 		resp, err := e.api.Delete(syncmodel.DeleteRequest{
 			OperationID: fileutil.NewID(),
 			DeviceID:    e.cfg.DeviceID,
@@ -452,28 +709,51 @@ func (e *Engine) pushLocal(ctx context.Context) error {
 			BaseVersion: known.VersionID,
 		})
 		if err != nil {
+			e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
 			return err
 		}
 		if resp.Status == "ok" {
-			_ = e.state.Set(rel, syncmodel.LocalFileState{
+			if err := e.state.Set(rel, syncmodel.LocalFileState{
 				Path:      rel,
 				FileID:    known.FileID,
 				VersionID: resp.Version.VersionID,
 				State:     syncmodel.EntryDeleted,
 				UpdatedAt: time.Now().Unix(),
-			})
+			}); err != nil {
+				e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
+				return err
+			}
+			e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusSuccess, rel, nil, time.Since(started))
 		}
 	}
 	return nil
 }
 
+func (e *Engine) reportRecord(action, status, path string, err error, duration time.Duration) {
+	req := syncmodel.SyncRecordRequest{
+		SpaceID:        e.cfg.SpaceID,
+		DeviceID:       e.cfg.DeviceID,
+		RootPath:       e.cfg.Root,
+		Path:           path,
+		Action:         action,
+		Status:         status,
+		DurationMillis: duration.Milliseconds(),
+	}
+	if err != nil {
+		req.Error = err.Error()
+	}
+	_ = e.api.ReportSyncRecord(req)
+}
+
 func (e *Engine) uploadFile(ctx context.Context, entry localScanEntry, known syncmodel.LocalFileState) error {
+	started := time.Now()
 	hashes := make([]string, 0, len(entry.Chunks))
 	for _, chunk := range entry.Chunks {
 		hashes = append(hashes, chunk.Hash)
 	}
 	missing, err := e.api.CheckChunks(hashes)
 	if err != nil {
+		e.reportRecord(syncmodel.SyncActionUpload, syncmodel.SyncRecordStatusFailed, entry.Path, err, time.Since(started))
 		return err
 	}
 	missingSet := map[string]bool{}
@@ -492,6 +772,7 @@ func (e *Engine) uploadFile(ctx context.Context, entry localScanEntry, known syn
 			return e.api.UploadChunk(ref.Hash, data)
 		})
 		if err != nil {
+			e.reportRecord(syncmodel.SyncActionUpload, syncmodel.SyncRecordStatusFailed, entry.Path, err, time.Since(started))
 			return err
 		}
 	}
@@ -513,23 +794,32 @@ func (e *Engine) uploadFile(ctx context.Context, entry localScanEntry, known syn
 	e.log.Info("commit file", "path", entry.Path, "size", entry.Size)
 	resp, err := e.api.Commit(req)
 	if err != nil {
+		e.reportRecord(syncmodel.SyncActionUpload, syncmodel.SyncRecordStatusFailed, entry.Path, err, time.Since(started))
 		return err
 	}
 	if resp.Conflict {
 		e.log.Warn("server created conflict copy", "path", entry.Path, "conflict_path", resp.ConflictPath)
+		e.reportRecord(syncmodel.SyncActionConflict, syncmodel.SyncRecordStatusSuccess, entry.Path, nil, time.Since(started))
 	}
 	localPath := resp.Version.Path
 	if localPath != entry.Path && resp.ConflictPath != "" {
-		target := filepath.Join(e.cfg.Root, filepath.FromSlash(resp.ConflictPath))
+		target := filepath.Join(e.cfg.LocalRoot, filepath.FromSlash(resp.ConflictPath))
 		if err := fileutil.EnsureParent(target); err != nil {
+			e.reportRecord(syncmodel.SyncActionUpload, syncmodel.SyncRecordStatusFailed, entry.Path, err, time.Since(started))
 			return err
 		}
 		if err := os.Rename(entry.AbsPath, target); err != nil {
+			e.reportRecord(syncmodel.SyncActionUpload, syncmodel.SyncRecordStatusFailed, entry.Path, err, time.Since(started))
 			return err
 		}
 		_ = e.state.Delete(entry.Path)
 	}
-	return e.state.Set(localPath, stateFromVersion(resp.Version))
+	if err := e.state.Set(localPath, stateFromVersion(resp.Version)); err != nil {
+		e.reportRecord(syncmodel.SyncActionUpload, syncmodel.SyncRecordStatusFailed, entry.Path, err, time.Since(started))
+		return err
+	}
+	e.reportRecord(syncmodel.SyncActionUpload, syncmodel.SyncRecordStatusSuccess, localPath, nil, time.Since(started))
+	return nil
 }
 
 func (e *Engine) pullRemote(ctx context.Context) error {
@@ -561,11 +851,13 @@ func (e *Engine) pullRemote(ctx context.Context) error {
 }
 
 func (e *Engine) applyVersion(ctx context.Context, version syncmodel.FileVersion) error {
-	rel, err := fileutil.SafeRel(e.cfg.Root, version.Path)
+	started := time.Now()
+	rel, err := fileutil.CleanRel(version.Path)
 	if err != nil {
+		e.reportRecord(syncmodel.SyncActionDownload, syncmodel.SyncRecordStatusFailed, version.Path, err, time.Since(started))
 		return err
 	}
-	target := filepath.Join(e.cfg.Root, filepath.FromSlash(rel))
+	target := filepath.Join(e.cfg.LocalRoot, filepath.FromSlash(rel))
 	known, hasKnown := e.state.Get(rel)
 	switch version.State {
 	case syncmodel.EntryDeleted:
@@ -579,14 +871,23 @@ func (e *Engine) applyVersion(ctx context.Context, version syncmodel.FileVersion
 				return err
 			}
 			if err := os.Rename(target, conflict); err != nil && !errors.Is(err, os.ErrNotExist) {
+				e.reportRecord(syncmodel.SyncActionConflict, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
 				return err
 			}
+			e.reportRecord(syncmodel.SyncActionConflict, syncmodel.SyncRecordStatusSuccess, rel, nil, time.Since(started))
 		} else if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+			e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
 			return err
 		}
-		return e.state.Set(rel, stateFromVersion(version))
+		if err := e.state.Set(rel, stateFromVersion(version)); err != nil {
+			e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
+			return err
+		}
+		e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusSuccess, rel, nil, time.Since(started))
+		return nil
 	case syncmodel.EntryFile:
 		if hasKnown && known.VersionID == version.VersionID {
+			e.reportRecord(syncmodel.SyncActionSkip, syncmodel.SyncRecordStatusSuccess, rel, nil, time.Since(started))
 			return nil
 		}
 		if hasLocalDivergence(target, known) {
@@ -596,15 +897,25 @@ func (e *Engine) applyVersion(ctx context.Context, version syncmodel.FileVersion
 				return err
 			}
 			if err := os.Rename(target, conflict); err != nil && !errors.Is(err, os.ErrNotExist) {
+				e.reportRecord(syncmodel.SyncActionConflict, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
 				return err
 			}
+			e.reportRecord(syncmodel.SyncActionConflict, syncmodel.SyncRecordStatusSuccess, rel, nil, time.Since(started))
 		}
 		if err := e.downloadVersion(ctx, target, version); err != nil {
+			e.reportRecord(syncmodel.SyncActionDownload, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
 			return err
 		}
-		return e.state.Set(rel, stateFromVersion(version))
+		if err := e.state.Set(rel, stateFromVersion(version)); err != nil {
+			e.reportRecord(syncmodel.SyncActionDownload, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
+			return err
+		}
+		e.reportRecord(syncmodel.SyncActionDownload, syncmodel.SyncRecordStatusSuccess, rel, nil, time.Since(started))
+		return nil
 	default:
-		return fmt.Errorf("unknown version state %q", version.State)
+		err := fmt.Errorf("unknown version state %q", version.State)
+		e.reportRecord(syncmodel.SyncActionDownload, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
+		return err
 	}
 }
 
@@ -649,7 +960,7 @@ func (e *Engine) downloadVersion(ctx context.Context, target string, version syn
 }
 
 func (e *Engine) scanLocal() (map[string]localScanEntry, error) {
-	root := e.cfg.Root
+	root := e.cfg.LocalRoot
 	out := map[string]localScanEntry{}
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {

@@ -7,17 +7,19 @@ import (
 	"path/filepath"
 
 	"xcloud/internal/fileutil"
+	"xcloud/internal/syncmodel"
 )
 
 type LocalConfig struct {
-	ServerURL    string `json:"server_url"`
-	Token        string `json:"token,omitempty"`
-	SpaceID      string `json:"space_id,omitempty"`
-	DeviceID     string `json:"device_id,omitempty"`
-	Username     string `json:"username,omitempty"`
-	DisplayName  string `json:"display_name,omitempty"`
-	SyncEnabled  bool   `json:"sync_enabled"`
-	DeleteRemote bool   `json:"delete_remote,omitempty"`
+	ServerURL    string                 `json:"server_url"`
+	Token        string                 `json:"token,omitempty"`
+	SpaceID      string                 `json:"space_id,omitempty"`
+	DeviceID     string                 `json:"device_id,omitempty"`
+	Username     string                 `json:"username,omitempty"`
+	DisplayName  string                 `json:"display_name,omitempty"`
+	SyncEnabled  bool                   `json:"sync_enabled"`
+	DeleteRemote bool                   `json:"delete_remote,omitempty"`
+	SyncSettings syncmodel.SyncSettings `json:"sync_settings"`
 }
 
 func DefaultLocalConfigPath() string {
@@ -43,6 +45,7 @@ func LoadLocalConfig(path string) (LocalConfig, error) {
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return cfg, err
 	}
+	cfg.SyncSettings = syncmodel.NormalizeSyncSettings(cfg.SyncSettings)
 	return cfg, nil
 }
 
