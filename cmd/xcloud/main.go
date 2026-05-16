@@ -1,0 +1,124 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"xcloud/internal/client"
+	"xcloud/internal/server"
+	"xcloud/internal/syncmodel"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	switch os.Args[1] {
+	case "server":
+		if err := runServer(os.Args[2:], log); err != nil {
+			log.Error("server exited", "err", err)
+			os.Exit(1)
+		}
+	case "client":
+		if err := runClient(os.Args[2:], log); err != nil {
+			log.Error("client exited", "err", err)
+			os.Exit(1)
+		}
+	default:
+		usage()
+		os.Exit(2)
+	}
+}
+
+func runServer(args []string, log *slog.Logger) error {
+	fs := flag.NewFlagSet("server", flag.ExitOnError)
+	addr := fs.String("addr", ":8080", "HTTP listen address")
+	data := fs.String("data", "./xcloud-data", "server data directory")
+	token := fs.String("token", env("XCLOUD_TOKEN", ""), "Bearer token; can also use XCLOUD_TOKEN")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	store, err := server.NewStore(*data)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           server.New(store, *token, log).Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Info("xcloud server listening", "addr", *addr, "data", *data)
+	return srv.ListenAndServe()
+}
+
+func runClient(args []string, log *slog.Logger) error {
+	fs := flag.NewFlagSet("client", flag.ExitOnError)
+	root := fs.String("root", "", "directory to sync")
+	serverURL := fs.String("server", "http://127.0.0.1:8080", "server URL")
+	token := fs.String("token", env("XCLOUD_TOKEN", ""), "Bearer token; can also use XCLOUD_TOKEN")
+	deviceID := fs.String("device", env("XCLOUD_DEVICE_ID", ""), "device ID; defaults to hostname")
+	statePath := fs.String("state", "", "client state file; defaults to <root>/.xcloud/state.json")
+	interval := fs.Duration("interval", 10*time.Second, "sync interval")
+	chunkSize := fs.Int("chunk-size", syncmodel.DefaultChunkSize, "chunk size in bytes")
+	once := fs.Bool("once", false, "run one sync cycle and exit")
+	deleteRemote := fs.Bool("delete-remote", false, "propagate local deletes to server")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *root == "" {
+		return fmt.Errorf("-root is required")
+	}
+	if *statePath == "" {
+		*statePath = filepath.Join(*root, ".xcloud", "state.json")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	engine, err := client.NewEngine(client.Config{
+		Root:         *root,
+		StatePath:    *statePath,
+		ServerURL:    *serverURL,
+		Token:        *token,
+		DeviceID:     *deviceID,
+		Interval:     *interval,
+		ChunkSize:    *chunkSize,
+		Once:         *once,
+		DeleteRemote: *deleteRemote,
+		Log:          log,
+	})
+	if err != nil {
+		return err
+	}
+	log.Info("xcloud client started", "root", *root, "server", *serverURL, "interval", *interval)
+	return engine.Run(ctx)
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `xcloud - secure central file sync MVP
+
+Usage:
+  xcloud server -addr :8080 -data ./xcloud-data -token secret
+  xcloud client -root ./docs -server http://127.0.0.1:8080 -token secret
+
+Commands:
+  server    start the central sync server
+  client    sync one local directory with the server
+
+`)
+}
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
