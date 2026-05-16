@@ -22,6 +22,7 @@ type Config struct {
 	StatePath    string
 	ServerURL    string
 	Token        string
+	SpaceID      string
 	DeviceID     string
 	Interval     time.Duration
 	ChunkSize    int
@@ -53,6 +54,9 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if cfg.ServerURL == "" {
 		return nil, errors.New("server URL is required")
 	}
+	if cfg.SpaceID == "" {
+		cfg.SpaceID = "default"
+	}
 	if cfg.DeviceID == "" {
 		host, _ := os.Hostname()
 		if host == "" {
@@ -81,9 +85,12 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := state.SeedSpace(cfg.SpaceID); err != nil {
+		return nil, err
+	}
 	return &Engine{
 		cfg:   cfg,
-		api:   NewAPI(cfg.ServerURL, cfg.Token),
+		api:   NewAPI(cfg.ServerURL, cfg.Token, cfg.SpaceID, cfg.DeviceID, cfg.Root),
 		state: state,
 		log:   cfg.Log,
 	}, nil
@@ -111,6 +118,13 @@ func (e *Engine) SyncOnce(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	selected, err := e.ensureFolderSelected()
+	if err != nil {
+		return err
+	}
+	if !selected {
+		return nil
+	}
 	if err := e.pullRemote(ctx); err != nil {
 		return err
 	}
@@ -118,6 +132,37 @@ func (e *Engine) SyncOnce(ctx context.Context) error {
 		return err
 	}
 	return e.pullRemote(ctx)
+}
+
+func (e *Engine) ensureFolderSelected() (bool, error) {
+	host, _ := os.Hostname()
+	resp, err := e.api.ReportFolder(syncmodel.FolderReportRequest{
+		DeviceID:         e.cfg.DeviceID,
+		Hostname:         host,
+		RootPath:         e.cfg.Root,
+		SuggestedSpaceID: e.cfg.SpaceID,
+	})
+	if err != nil {
+		return false, err
+	}
+	if !resp.Selected || resp.Space == nil {
+		e.log.Info("client folder reported; waiting for gateway selection",
+			"device", e.cfg.DeviceID,
+			"root", e.cfg.Root,
+			"suggested_space", e.cfg.SpaceID,
+			"status", resp.Folder.Status,
+		)
+		return false, nil
+	}
+	if resp.Space.ID != e.cfg.SpaceID {
+		e.log.Info("gateway assigned sync space", "device", e.cfg.DeviceID, "root", e.cfg.Root, "space", resp.Space.ID)
+	}
+	e.cfg.SpaceID = resp.Space.ID
+	e.api.SetSyncContext(resp.Space.ID, e.cfg.DeviceID, e.cfg.Root)
+	if err := e.state.EnsureSpace(resp.Space.ID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (e *Engine) pushLocal(ctx context.Context) error {

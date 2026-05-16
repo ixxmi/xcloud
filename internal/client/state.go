@@ -20,6 +20,7 @@ type State struct {
 type StateData struct {
 	Files        map[string]syncmodel.LocalFileState `json:"files"`
 	LastEventSeq int64                               `json:"last_event_seq"`
+	SpaceID      string                              `json:"space_id,omitempty"`
 }
 
 func OpenState(path string) (*State, error) {
@@ -76,6 +77,30 @@ func (s *State) Snapshot() map[string]syncmodel.LocalFileState {
 		out[k] = v
 	}
 	return out
+}
+
+func (s *State) EnsureSpace(spaceID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Data.SpaceID == spaceID {
+		return nil
+	}
+	if s.Data.SpaceID != "" && spaceID != "" {
+		s.Data.Files = map[string]syncmodel.LocalFileState{}
+		s.Data.LastEventSeq = 0
+	}
+	s.Data.SpaceID = spaceID
+	return s.saveLocked()
+}
+
+func (s *State) SeedSpace(spaceID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Data.SpaceID != "" || spaceID == "" {
+		return nil
+	}
+	s.Data.SpaceID = spaceID
+	return s.saveLocked()
 }
 
 func (s *State) LastEventSeq() int64 {

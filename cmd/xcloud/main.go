@@ -65,7 +65,8 @@ func runClient(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
 	root := fs.String("root", "", "directory to sync")
 	serverURL := fs.String("server", "http://127.0.0.1:8080", "server URL")
-	token := fs.String("token", env("XCLOUD_TOKEN", ""), "Bearer token; can also use XCLOUD_TOKEN")
+	token := fs.String("token", env("XCLOUD_TOKEN", ""), "account sync token; can also use XCLOUD_TOKEN")
+	spaceID := fs.String("space", env("XCLOUD_SPACE", "default"), "suggested sync space ID for gateway selection; can also use XCLOUD_SPACE")
 	deviceID := fs.String("device", env("XCLOUD_DEVICE_ID", ""), "device ID; defaults to hostname")
 	statePath := fs.String("state", "", "client state file; defaults to <root>/.xcloud/state.json")
 	interval := fs.Duration("interval", 10*time.Second, "sync interval")
@@ -88,6 +89,7 @@ func runClient(args []string, log *slog.Logger) error {
 		StatePath:    *statePath,
 		ServerURL:    *serverURL,
 		Token:        *token,
+		SpaceID:      *spaceID,
 		DeviceID:     *deviceID,
 		Interval:     *interval,
 		ChunkSize:    *chunkSize,
@@ -98,7 +100,7 @@ func runClient(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	log.Info("xcloud client started", "root", *root, "server", *serverURL, "interval", *interval)
+	log.Info("xcloud client started", "root", *root, "server", *serverURL, "suggested_space", *spaceID, "interval", *interval)
 	return engine.Run(ctx)
 }
 
@@ -106,12 +108,12 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `xcloud - secure central file sync MVP
 
 Usage:
-  xcloud server -addr :8080 -data ./xcloud-data -token secret
-  xcloud client -root ./docs -server http://127.0.0.1:8080 -token secret
+  xcloud server -addr :8080 -data ./xcloud-data
+  xcloud client -root ./docs -server http://127.0.0.1:8080 -token account-token -space default
 
 Commands:
   server    start the central sync server
-  client    sync one local directory with the server
+  client    report and sync one local directory after gateway selection
 
 `)
 }

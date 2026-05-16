@@ -5,7 +5,48 @@ const (
 
 	EntryFile    = "file"
 	EntryDeleted = "deleted"
+
+	FolderPending  = "pending"
+	FolderSelected = "selected"
+	FolderDisabled = "disabled"
 )
+
+type Account struct {
+	ID            string `json:"id"`
+	Username      string `json:"username"`
+	DisplayName   string `json:"display_name,omitempty"`
+	Email         string `json:"email,omitempty"`
+	PasswordHash  string `json:"password_hash"`
+	SyncTokenHash string `json:"sync_token_hash"`
+	IsAdmin       bool   `json:"is_admin"`
+	Disabled      bool   `json:"disabled"`
+	CreatedAt     int64  `json:"created_at"`
+	UpdatedAt     int64  `json:"updated_at"`
+}
+
+type SyncSpace struct {
+	ID          string `json:"id"`
+	AccountID   string `json:"account_id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Active      bool   `json:"active"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
+}
+
+type ClientFolder struct {
+	ID               string `json:"id"`
+	AccountID        string `json:"account_id"`
+	DeviceID         string `json:"device_id"`
+	Hostname         string `json:"hostname,omitempty"`
+	RootPath         string `json:"root_path"`
+	SuggestedSpaceID string `json:"suggested_space_id,omitempty"`
+	SpaceID          string `json:"space_id,omitempty"`
+	Status           string `json:"status"`
+	LastSeenAt       int64  `json:"last_seen_at"`
+	CreatedAt        int64  `json:"created_at"`
+	UpdatedAt        int64  `json:"updated_at"`
+}
 
 type ChunkRef struct {
 	Index int    `json:"index"`
@@ -14,6 +55,8 @@ type ChunkRef struct {
 }
 
 type FileVersion struct {
+	AccountID   string     `json:"account_id,omitempty"`
+	SpaceID     string     `json:"space_id,omitempty"`
 	FileID      string     `json:"file_id"`
 	Path        string     `json:"path"`
 	VersionID   string     `json:"version_id"`
@@ -29,6 +72,8 @@ type FileVersion struct {
 }
 
 type FileEntry struct {
+	AccountID     string       `json:"account_id,omitempty"`
+	SpaceID       string       `json:"space_id,omitempty"`
 	FileID        string       `json:"file_id"`
 	Path          string       `json:"path"`
 	Current       *FileVersion `json:"current,omitempty"`
@@ -50,16 +95,22 @@ type LocalFileState struct {
 }
 
 type ServerState struct {
-	Files        map[string]*FileEntry     `json:"files"`
-	Versions     map[string][]FileVersion  `json:"versions"`
-	ChunkRefs    map[string]int            `json:"chunk_refs"`
-	DeviceSeq    map[string]int64          `json:"device_seq"`
-	Operations   map[string]CommitResponse `json:"operations"`
-	LastEventSeq int64                     `json:"last_event_seq"`
-	Events       []Event                   `json:"events"`
+	Accounts      map[string]*Account       `json:"accounts"`
+	Spaces        map[string]*SyncSpace     `json:"spaces"`
+	ClientFolders map[string]*ClientFolder  `json:"client_folders"`
+	Files         map[string]*FileEntry     `json:"files"`
+	Versions      map[string][]FileVersion  `json:"versions"`
+	ChunkRefs     map[string]int            `json:"chunk_refs"`
+	AccountChunks map[string]bool           `json:"account_chunks"`
+	DeviceSeq     map[string]int64          `json:"device_seq"`
+	Operations    map[string]CommitResponse `json:"operations"`
+	LastEventSeq  int64                     `json:"last_event_seq"`
+	Events        []Event                   `json:"events"`
 }
 
 type Event struct {
+	AccountID string      `json:"account_id,omitempty"`
+	SpaceID   string      `json:"space_id,omitempty"`
 	Seq       int64       `json:"seq"`
 	Path      string      `json:"path"`
 	FileID    string      `json:"file_id"`
@@ -68,6 +119,19 @@ type Event struct {
 	DeviceID  string      `json:"device_id"`
 	CreatedAt int64       `json:"created_at"`
 	Version   FileVersion `json:"version"`
+}
+
+type FolderReportRequest struct {
+	DeviceID         string `json:"device_id"`
+	Hostname         string `json:"hostname,omitempty"`
+	RootPath         string `json:"root_path"`
+	SuggestedSpaceID string `json:"suggested_space_id,omitempty"`
+}
+
+type FolderReportResponse struct {
+	Folder   ClientFolder `json:"folder"`
+	Space    *SyncSpace   `json:"space,omitempty"`
+	Selected bool         `json:"selected"`
 }
 
 type Manifest struct {
@@ -121,4 +185,11 @@ type EventsResponse struct {
 
 type ErrorResponse struct {
 	Error string `json:"error"`
+}
+
+type SpaceSummary struct {
+	Space     SyncSpace `json:"space"`
+	FileCount int       `json:"file_count"`
+	Deleted   int       `json:"deleted"`
+	Folders   int       `json:"folders"`
 }

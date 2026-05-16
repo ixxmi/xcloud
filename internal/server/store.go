@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,11 @@ import (
 
 const maxEvents = 10000
 
+const (
+	defaultAdminUser = "admin"
+	defaultAdminPass = "admin123"
+)
+
 type Store struct {
 	mu        sync.Mutex
 	root      string
@@ -35,14 +41,21 @@ func NewStore(root string) (*Store, error) {
 		root:      root,
 		statePath: filepath.Join(root, "metadata.json"),
 		state: syncmodel.ServerState{
-			Files:      map[string]*syncmodel.FileEntry{},
-			Versions:   map[string][]syncmodel.FileVersion{},
-			ChunkRefs:  map[string]int{},
-			DeviceSeq:  map[string]int64{},
-			Operations: map[string]syncmodel.CommitResponse{},
+			Accounts:      map[string]*syncmodel.Account{},
+			Spaces:        map[string]*syncmodel.SyncSpace{},
+			ClientFolders: map[string]*syncmodel.ClientFolder{},
+			Files:         map[string]*syncmodel.FileEntry{},
+			Versions:      map[string][]syncmodel.FileVersion{},
+			ChunkRefs:     map[string]int{},
+			AccountChunks: map[string]bool{},
+			DeviceSeq:     map[string]int64{},
+			Operations:    map[string]syncmodel.CommitResponse{},
 		},
 	}
 	if err := s.load(); err != nil {
+		return nil, err
+	}
+	if err := s.ensureBootstrap(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -62,6 +75,15 @@ func (s *Store) load() error {
 	if err := json.Unmarshal(b, &s.state); err != nil {
 		return err
 	}
+	if s.state.Accounts == nil {
+		s.state.Accounts = map[string]*syncmodel.Account{}
+	}
+	if s.state.Spaces == nil {
+		s.state.Spaces = map[string]*syncmodel.SyncSpace{}
+	}
+	if s.state.ClientFolders == nil {
+		s.state.ClientFolders = map[string]*syncmodel.ClientFolder{}
+	}
 	if s.state.Files == nil {
 		s.state.Files = map[string]*syncmodel.FileEntry{}
 	}
@@ -71,6 +93,9 @@ func (s *Store) load() error {
 	if s.state.ChunkRefs == nil {
 		s.state.ChunkRefs = map[string]int{}
 	}
+	if s.state.AccountChunks == nil {
+		s.state.AccountChunks = map[string]bool{}
+	}
 	if s.state.DeviceSeq == nil {
 		s.state.DeviceSeq = map[string]int64{}
 	}
@@ -78,6 +103,136 @@ func (s *Store) load() error {
 		s.state.Operations = map[string]syncmodel.CommitResponse{}
 	}
 	return nil
+}
+
+func (s *Store) ensureBootstrap() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.state.Accounts) == 0 {
+		now := time.Now().Unix()
+		account := &syncmodel.Account{
+			ID:            fileutil.NewID(),
+			Username:      defaultAdminUser,
+			DisplayName:   "Administrator",
+			PasswordHash:  HashSecret(defaultAdminPass),
+			SyncTokenHash: HashSecret(fileutil.NewID()),
+			IsAdmin:       true,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
+		s.state.Accounts[account.ID] = account
+		space := &syncmodel.SyncSpace{
+			ID:        "default",
+			AccountID: account.ID,
+			Name:      "default",
+			Active:    true,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		s.state.Spaces[spaceKey(account.ID, space.ID)] = space
+		s.migrateLegacyScopeLocked(account.ID, space.ID)
+		return s.saveLocked()
+	}
+	changed := s.normalizeAccountsLocked()
+	if s.normalizeFoldersLocked() {
+		changed = true
+	}
+	var firstAccount *syncmodel.Account
+	for _, account := range s.state.Accounts {
+		firstAccount = account
+		break
+	}
+	if firstAccount == nil {
+		return nil
+	}
+	if s.state.Spaces[spaceKey(firstAccount.ID, "default")] == nil {
+		now := time.Now().Unix()
+		s.state.Spaces[spaceKey(firstAccount.ID, "default")] = &syncmodel.SyncSpace{
+			ID:        "default",
+			AccountID: firstAccount.ID,
+			Name:      "default",
+			Active:    true,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		changed = true
+	}
+	if s.migrateLegacyScopeLocked(firstAccount.ID, "default") {
+		changed = true
+	}
+	if changed {
+		return s.saveLocked()
+	}
+	return nil
+}
+
+func (s *Store) normalizeAccountsLocked() bool {
+	changed := false
+	for _, account := range s.state.Accounts {
+		if account.DisplayName == "" {
+			account.DisplayName = account.Username
+			changed = true
+		}
+		normalizedEmail := strings.ToLower(strings.TrimSpace(account.Email))
+		if account.Email != normalizedEmail {
+			account.Email = normalizedEmail
+			changed = true
+		}
+	}
+	return changed
+}
+
+func (s *Store) normalizeFoldersLocked() bool {
+	changed := false
+	for _, folder := range s.state.ClientFolders {
+		if folder.Status == "" {
+			folder.Status = syncmodel.FolderPending
+			changed = true
+		}
+	}
+	return changed
+}
+
+func (s *Store) migrateLegacyScopeLocked(accountID, spaceID string) bool {
+	changed := false
+	newFiles := map[string]*syncmodel.FileEntry{}
+	for key, entry := range s.state.Files {
+		if entry.AccountID == "" {
+			entry.AccountID = accountID
+			entry.SpaceID = spaceID
+			changed = true
+		}
+		newFiles[fileKey(entry.AccountID, entry.SpaceID, entry.Path)] = entry
+		if key != fileKey(entry.AccountID, entry.SpaceID, entry.Path) {
+			changed = true
+		}
+	}
+	s.state.Files = newFiles
+	for fileID, versions := range s.state.Versions {
+		for i := range versions {
+			if versions[i].AccountID == "" {
+				versions[i].AccountID = accountID
+				versions[i].SpaceID = spaceID
+				changed = true
+			}
+		}
+		s.state.Versions[fileID] = versions
+	}
+	for i := range s.state.Events {
+		if s.state.Events[i].AccountID == "" {
+			s.state.Events[i].AccountID = accountID
+			s.state.Events[i].SpaceID = spaceID
+			changed = true
+		}
+	}
+	for hash := range s.state.ChunkRefs {
+		key := accountChunkKey(accountID, hash)
+		if !s.state.AccountChunks[key] {
+			s.state.AccountChunks[key] = true
+			changed = true
+		}
+	}
+	return changed
 }
 
 func (s *Store) saveLocked() error {
@@ -89,6 +244,417 @@ func (s *Store) saveLocked() error {
 		_, err := f.Write(b)
 		return err
 	})
+}
+
+func HashSecret(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
+
+func VerifySecret(secret, hash string) bool {
+	if secret == "" || hash == "" {
+		return false
+	}
+	got := HashSecret(secret)
+	return subtle.ConstantTimeCompare([]byte(got), []byte(hash)) == 1
+}
+
+func (s *Store) AuthenticateSyncToken(token string) (*syncmodel.Account, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, account := range s.state.Accounts {
+		if account.Disabled {
+			continue
+		}
+		if VerifySecret(token, account.SyncTokenHash) {
+			copy := *account
+			return &copy, true
+		}
+	}
+	return nil, false
+}
+
+func (s *Store) AuthenticatePassword(identifier, password string) (*syncmodel.Account, bool) {
+	identifier = strings.ToLower(strings.TrimSpace(identifier))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, account := range s.state.Accounts {
+		if account.Disabled {
+			continue
+		}
+		username := strings.ToLower(account.Username)
+		email := strings.ToLower(account.Email)
+		if username != identifier && (email == "" || email != identifier) {
+			continue
+		}
+		if VerifySecret(password, account.PasswordHash) {
+			copy := *account
+			return &copy, true
+		}
+	}
+	return nil, false
+}
+
+func (s *Store) GetAccount(id string) (*syncmodel.Account, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.state.Accounts[id]
+	if account == nil || account.Disabled {
+		return nil, false
+	}
+	copy := *account
+	return &copy, true
+}
+
+func (s *Store) AccountByUsername(username string) (*syncmodel.Account, bool) {
+	username = strings.ToLower(strings.TrimSpace(username))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, account := range s.state.Accounts {
+		if strings.ToLower(account.Username) == username {
+			copy := *account
+			return &copy, true
+		}
+	}
+	return nil, false
+}
+
+func (s *Store) ListAccounts() []syncmodel.Account {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	accounts := make([]syncmodel.Account, 0, len(s.state.Accounts))
+	for _, account := range s.state.Accounts {
+		copy := *account
+		copy.PasswordHash = ""
+		copy.SyncTokenHash = ""
+		accounts = append(accounts, copy)
+	}
+	sort.Slice(accounts, func(i, j int) bool {
+		return accounts[i].Username < accounts[j].Username
+	})
+	return accounts
+}
+
+func (s *Store) CreateAccount(username, email, displayName, password string, admin bool) (syncmodel.Account, string, error) {
+	username = strings.TrimSpace(username)
+	email = strings.ToLower(strings.TrimSpace(email))
+	displayName = strings.TrimSpace(displayName)
+	if username == "" {
+		return syncmodel.Account{}, "", errors.New("username is required")
+	}
+	if !validAccountName(username) {
+		return syncmodel.Account{}, "", errors.New("username can only contain letters, numbers, dots, underscores, and hyphens")
+	}
+	if email != "" && !strings.Contains(email, "@") {
+		return syncmodel.Account{}, "", errors.New("email is invalid")
+	}
+	if displayName == "" {
+		displayName = username
+	}
+	if password == "" {
+		return syncmodel.Account{}, "", errors.New("password is required")
+	}
+	if len(password) < 8 {
+		return syncmodel.Account{}, "", errors.New("password must be at least 8 characters")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, account := range s.state.Accounts {
+		if strings.EqualFold(account.Username, username) {
+			return syncmodel.Account{}, "", fmt.Errorf("account %q already exists", username)
+		}
+		if email != "" && strings.EqualFold(account.Email, email) {
+			return syncmodel.Account{}, "", fmt.Errorf("email %q is already registered", email)
+		}
+	}
+	now := time.Now().Unix()
+	token := fileutil.NewID() + fileutil.NewID()
+	account := &syncmodel.Account{
+		ID:            fileutil.NewID(),
+		Username:      username,
+		DisplayName:   displayName,
+		Email:         email,
+		PasswordHash:  HashSecret(password),
+		SyncTokenHash: HashSecret(token),
+		IsAdmin:       admin,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	s.state.Accounts[account.ID] = account
+	space := &syncmodel.SyncSpace{
+		ID:        "default",
+		AccountID: account.ID,
+		Name:      "default",
+		Active:    true,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	s.state.Spaces[spaceKey(account.ID, space.ID)] = space
+	if err := s.saveLocked(); err != nil {
+		return syncmodel.Account{}, "", err
+	}
+	copy := *account
+	copy.PasswordHash = ""
+	copy.SyncTokenHash = ""
+	return copy, token, nil
+}
+
+func (s *Store) ChangePassword(accountID, currentPassword, newPassword string) error {
+	if len(newPassword) < 8 {
+		return errors.New("new password must be at least 8 characters")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.state.Accounts[accountID]
+	if account == nil || account.Disabled {
+		return errors.New("account not found")
+	}
+	if !VerifySecret(currentPassword, account.PasswordHash) {
+		return errors.New("current password is incorrect")
+	}
+	account.PasswordHash = HashSecret(newPassword)
+	account.UpdatedAt = time.Now().Unix()
+	return s.saveLocked()
+}
+
+func (s *Store) ResetSyncToken(accountID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.state.Accounts[accountID]
+	if account == nil {
+		return "", errors.New("account not found")
+	}
+	token := fileutil.NewID() + fileutil.NewID()
+	account.SyncTokenHash = HashSecret(token)
+	account.UpdatedAt = time.Now().Unix()
+	if err := s.saveLocked(); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (s *Store) SetAccountDisabled(accountID string, disabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.state.Accounts[accountID]
+	if account == nil {
+		return errors.New("account not found")
+	}
+	account.Disabled = disabled
+	account.UpdatedAt = time.Now().Unix()
+	return s.saveLocked()
+}
+
+func (s *Store) ListSpaces(accountID string) []syncmodel.SpaceSummary {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []syncmodel.SpaceSummary{}
+	for _, space := range s.state.Spaces {
+		if space.AccountID != accountID {
+			continue
+		}
+		summary := syncmodel.SpaceSummary{Space: *space}
+		for _, entry := range s.state.Files {
+			if entry.AccountID != accountID || entry.SpaceID != space.ID {
+				continue
+			}
+			if entry.Deleted {
+				summary.Deleted++
+			} else {
+				summary.FileCount++
+			}
+		}
+		for _, folder := range s.state.ClientFolders {
+			if folder.AccountID == accountID && folder.SpaceID == space.ID && folder.Status == syncmodel.FolderSelected {
+				summary.Folders++
+			}
+		}
+		out = append(out, summary)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Space.Name < out[j].Space.Name
+	})
+	return out
+}
+
+func (s *Store) ReportFolder(accountID string, req syncmodel.FolderReportRequest) (syncmodel.FolderReportResponse, error) {
+	deviceID := strings.TrimSpace(req.DeviceID)
+	rootPath := strings.TrimSpace(req.RootPath)
+	hostname := strings.TrimSpace(req.Hostname)
+	if deviceID == "" {
+		return syncmodel.FolderReportResponse{}, errors.New("device_id is required")
+	}
+	if rootPath == "" {
+		return syncmodel.FolderReportResponse{}, errors.New("root_path is required")
+	}
+	suggestedSpaceID := strings.TrimSpace(req.SuggestedSpaceID)
+	if suggestedSpaceID == "" {
+		suggestedSpaceID = "default"
+	}
+	now := time.Now().Unix()
+	key := folderKey(accountID, deviceID, rootPath)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	folder := s.state.ClientFolders[key]
+	if folder == nil {
+		folder = &syncmodel.ClientFolder{
+			ID:               fileutil.NewID(),
+			AccountID:        accountID,
+			DeviceID:         deviceID,
+			Hostname:         hostname,
+			RootPath:         rootPath,
+			SuggestedSpaceID: suggestedSpaceID,
+			Status:           syncmodel.FolderPending,
+			CreatedAt:        now,
+		}
+		s.state.ClientFolders[key] = folder
+	} else {
+		folder.Hostname = hostname
+		folder.SuggestedSpaceID = suggestedSpaceID
+	}
+	folder.LastSeenAt = now
+	folder.UpdatedAt = now
+	var space *syncmodel.SyncSpace
+	if folder.Status == syncmodel.FolderSelected && folder.SpaceID != "" {
+		if selected := s.state.Spaces[spaceKey(accountID, folder.SpaceID)]; selected != nil && selected.Active {
+			copy := *selected
+			space = &copy
+		}
+	}
+	if err := s.saveLocked(); err != nil {
+		return syncmodel.FolderReportResponse{}, err
+	}
+	return syncmodel.FolderReportResponse{
+		Folder:   *folder,
+		Space:    space,
+		Selected: space != nil,
+	}, nil
+}
+
+func (s *Store) ListFolders(accountID string) []syncmodel.ClientFolder {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []syncmodel.ClientFolder{}
+	for _, folder := range s.state.ClientFolders {
+		if folder.AccountID != accountID {
+			continue
+		}
+		out = append(out, *folder)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Status != out[j].Status {
+			return out[i].Status < out[j].Status
+		}
+		if out[i].DeviceID != out[j].DeviceID {
+			return out[i].DeviceID < out[j].DeviceID
+		}
+		return out[i].RootPath < out[j].RootPath
+	})
+	return out
+}
+
+func (s *Store) SelectFolder(accountID, folderID, spaceID string) error {
+	if folderID == "" {
+		return errors.New("folder_id is required")
+	}
+	if spaceID == "" {
+		return errors.New("space_id is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	space := s.state.Spaces[spaceKey(accountID, spaceID)]
+	if space == nil || !space.Active {
+		return errors.New("sync space not found")
+	}
+	for _, folder := range s.state.ClientFolders {
+		if folder.AccountID != accountID || folder.ID != folderID {
+			continue
+		}
+		folder.SpaceID = spaceID
+		folder.Status = syncmodel.FolderSelected
+		folder.UpdatedAt = time.Now().Unix()
+		return s.saveLocked()
+	}
+	return errors.New("client folder not found")
+}
+
+func (s *Store) DisableFolder(accountID, folderID string) error {
+	if folderID == "" {
+		return errors.New("folder_id is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, folder := range s.state.ClientFolders {
+		if folder.AccountID != accountID || folder.ID != folderID {
+			continue
+		}
+		folder.Status = syncmodel.FolderDisabled
+		folder.UpdatedAt = time.Now().Unix()
+		return s.saveLocked()
+	}
+	return errors.New("client folder not found")
+}
+
+func (s *Store) FolderSelected(accountID, deviceID, rootPath, spaceID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	folder := s.state.ClientFolders[folderKey(accountID, deviceID, rootPath)]
+	return folder != nil && folder.Status == syncmodel.FolderSelected && folder.SpaceID == spaceID
+}
+
+func (s *Store) CreateSpace(accountID, name, description string) (syncmodel.SyncSpace, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return syncmodel.SyncSpace{}, errors.New("space name is required")
+	}
+	id, err := fileutil.CleanRel(name)
+	if err != nil || strings.Contains(id, "/") {
+		id = fileutil.NewID()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.state.Spaces[spaceKey(accountID, id)] != nil {
+		id = fileutil.NewID()
+	}
+	now := time.Now().Unix()
+	space := &syncmodel.SyncSpace{
+		ID:          id,
+		AccountID:   accountID,
+		Name:        name,
+		Description: strings.TrimSpace(description),
+		Active:      true,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	s.state.Spaces[spaceKey(accountID, id)] = space
+	if err := s.saveLocked(); err != nil {
+		return syncmodel.SyncSpace{}, err
+	}
+	return *space, nil
+}
+
+func (s *Store) GetSpace(accountID, spaceID string) (*syncmodel.SyncSpace, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	space := s.state.Spaces[spaceKey(accountID, spaceID)]
+	if space == nil || !space.Active {
+		return nil, false
+	}
+	copy := *space
+	return &copy, true
+}
+
+func (s *Store) SetSpaceActive(accountID, spaceID string, active bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	space := s.state.Spaces[spaceKey(accountID, spaceID)]
+	if space == nil {
+		return errors.New("space not found")
+	}
+	space.Active = active
+	space.UpdatedAt = time.Now().Unix()
+	return s.saveLocked()
 }
 
 func (s *Store) ChunkPath(hash string) (string, error) {
@@ -124,21 +690,43 @@ func (s *Store) PutChunk(hash string, data []byte) error {
 	})
 }
 
-func (s *Store) CheckChunks(chunks []string) []string {
+func (s *Store) CheckChunks(accountID string, chunks []string) []string {
 	missing := make([]string, 0)
 	for _, hash := range chunks {
-		if !s.HasChunk(hash) {
+		if !s.HasAccountChunk(accountID, hash) {
 			missing = append(missing, hash)
 		}
 	}
 	return missing
 }
 
-func (s *Store) ListFiles() []syncmodel.FileEntry {
+func (s *Store) GrantAccountChunk(accountID, hash string) error {
+	if !s.HasChunk(hash) {
+		return fmt.Errorf("missing chunk %s", hash)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.AccountChunks[accountChunkKey(accountID, hash)] = true
+	return s.saveLocked()
+}
+
+func (s *Store) HasAccountChunk(accountID, hash string) bool {
+	if !s.HasChunk(hash) {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.AccountChunks[accountChunkKey(accountID, hash)]
+}
+
+func (s *Store) ListFiles(accountID, spaceID string) []syncmodel.FileEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	files := make([]syncmodel.FileEntry, 0, len(s.state.Files))
 	for _, entry := range s.state.Files {
+		if entry.AccountID != accountID || entry.SpaceID != spaceID {
+			continue
+		}
 		files = append(files, *entry)
 	}
 	sort.Slice(files, func(i, j int) bool {
@@ -147,19 +735,19 @@ func (s *Store) ListFiles() []syncmodel.FileEntry {
 	return files
 }
 
-func (s *Store) EventsAfter(after int64) []syncmodel.Event {
+func (s *Store) EventsAfter(accountID, spaceID string, after int64) []syncmodel.Event {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var events []syncmodel.Event
 	for _, event := range s.state.Events {
-		if event.Seq > after {
+		if event.AccountID == accountID && event.SpaceID == spaceID && event.Seq > after {
 			events = append(events, event)
 		}
 	}
 	return events
 }
 
-func (s *Store) Commit(req syncmodel.CommitRequest) (syncmodel.CommitResponse, error) {
+func (s *Store) Commit(accountID, spaceID string, req syncmodel.CommitRequest) (syncmodel.CommitResponse, error) {
 	if req.OperationID == "" {
 		return syncmodel.CommitResponse{}, errors.New("operation_id is required")
 	}
@@ -173,28 +761,35 @@ func (s *Store) Commit(req syncmodel.CommitRequest) (syncmodel.CommitResponse, e
 	if !isHash(manifest.Hash) {
 		return syncmodel.CommitResponse{}, errors.New("invalid file hash")
 	}
+	if _, ok := s.GetSpace(accountID, spaceID); !ok {
+		return syncmodel.CommitResponse{}, errors.New("sync space not found")
+	}
 	path, err := fileutil.CleanRel(manifest.Path)
 	if err != nil {
 		return syncmodel.CommitResponse{}, err
 	}
-	if err := s.verifyManifest(manifest); err != nil {
+	if err := s.verifyManifest(accountID, manifest); err != nil {
 		return syncmodel.CommitResponse{}, err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.state.Operations[req.OperationID]; ok {
+	opKey := operationKey(accountID, spaceID, req.OperationID)
+	if existing, ok := s.state.Operations[opKey]; ok {
 		return existing, nil
 	}
 
 	now := time.Now().Unix()
-	entry := s.state.Files[path]
+	key := fileKey(accountID, spaceID, path)
+	entry := s.state.Files[key]
 	if entry == nil {
 		entry = &syncmodel.FileEntry{
-			FileID: fileutil.NewID(),
-			Path:   path,
+			AccountID: accountID,
+			SpaceID:   spaceID,
+			FileID:    fileutil.NewID(),
+			Path:      path,
 		}
-		s.state.Files[path] = entry
+		s.state.Files[key] = entry
 	}
 	if manifest.FileID != "" && entry.FileID != manifest.FileID {
 		return syncmodel.CommitResponse{}, fmt.Errorf("file_id mismatch for %s", path)
@@ -206,14 +801,18 @@ func (s *Store) Commit(req syncmodel.CommitRequest) (syncmodel.CommitResponse, e
 		conflict = true
 		conflictPath = s.nextConflictPathLocked(path, req.DeviceID, now)
 		entry = &syncmodel.FileEntry{
-			FileID: fileutil.NewID(),
-			Path:   conflictPath,
+			AccountID: accountID,
+			SpaceID:   spaceID,
+			FileID:    fileutil.NewID(),
+			Path:      conflictPath,
 		}
-		s.state.Files[conflictPath] = entry
+		s.state.Files[fileKey(accountID, spaceID, conflictPath)] = entry
 		path = conflictPath
 	}
 
 	version := syncmodel.FileVersion{
+		AccountID:   accountID,
+		SpaceID:     spaceID,
 		FileID:      entry.FileID,
 		Path:        path,
 		VersionID:   fileutil.NewID(),
@@ -233,6 +832,7 @@ func (s *Store) Commit(req syncmodel.CommitRequest) (syncmodel.CommitResponse, e
 	s.state.Versions[entry.FileID] = append(s.state.Versions[entry.FileID], version)
 	for _, chunk := range version.Chunks {
 		s.state.ChunkRefs[chunk.Hash]++
+		s.state.AccountChunks[accountChunkKey(accountID, chunk.Hash)] = true
 	}
 	s.appendEventLocked(version)
 
@@ -243,14 +843,14 @@ func (s *Store) Commit(req syncmodel.CommitRequest) (syncmodel.CommitResponse, e
 		Conflict:     conflict,
 		ConflictPath: conflictPath,
 	}
-	s.state.Operations[req.OperationID] = resp
+	s.state.Operations[opKey] = resp
 	if err := s.saveLocked(); err != nil {
 		return syncmodel.CommitResponse{}, err
 	}
 	return resp, nil
 }
 
-func (s *Store) Delete(req syncmodel.DeleteRequest) (syncmodel.CommitResponse, error) {
+func (s *Store) Delete(accountID, spaceID string, req syncmodel.DeleteRequest) (syncmodel.CommitResponse, error) {
 	if req.OperationID == "" {
 		return syncmodel.CommitResponse{}, errors.New("operation_id is required")
 	}
@@ -260,10 +860,14 @@ func (s *Store) Delete(req syncmodel.DeleteRequest) (syncmodel.CommitResponse, e
 	if req.Path == "" {
 		return syncmodel.CommitResponse{}, errors.New("path is required")
 	}
+	if _, ok := s.GetSpace(accountID, spaceID); !ok {
+		return syncmodel.CommitResponse{}, errors.New("sync space not found")
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.state.Operations[req.OperationID]; ok {
+	opKey := operationKey(accountID, spaceID, req.OperationID)
+	if existing, ok := s.state.Operations[opKey]; ok {
 		return existing, nil
 	}
 
@@ -271,7 +875,7 @@ func (s *Store) Delete(req syncmodel.DeleteRequest) (syncmodel.CommitResponse, e
 	if err != nil {
 		return syncmodel.CommitResponse{}, err
 	}
-	entry := s.state.Files[path]
+	entry := s.state.Files[fileKey(accountID, spaceID, path)]
 	if entry == nil {
 		return syncmodel.CommitResponse{}, fmt.Errorf("path not found: %s", path)
 	}
@@ -285,7 +889,7 @@ func (s *Store) Delete(req syncmodel.DeleteRequest) (syncmodel.CommitResponse, e
 			Conflict:       true,
 			CurrentVersion: entry.Current,
 		}
-		s.state.Operations[req.OperationID] = resp
+		s.state.Operations[opKey] = resp
 		if err := s.saveLocked(); err != nil {
 			return syncmodel.CommitResponse{}, err
 		}
@@ -294,6 +898,8 @@ func (s *Store) Delete(req syncmodel.DeleteRequest) (syncmodel.CommitResponse, e
 
 	now := time.Now().Unix()
 	version := syncmodel.FileVersion{
+		AccountID:   accountID,
+		SpaceID:     spaceID,
 		FileID:      entry.FileID,
 		Path:        path,
 		VersionID:   fileutil.NewID(),
@@ -315,14 +921,14 @@ func (s *Store) Delete(req syncmodel.DeleteRequest) (syncmodel.CommitResponse, e
 		Entry:   *entry,
 		Version: version,
 	}
-	s.state.Operations[req.OperationID] = resp
+	s.state.Operations[opKey] = resp
 	if err := s.saveLocked(); err != nil {
 		return syncmodel.CommitResponse{}, err
 	}
 	return resp, nil
 }
 
-func (s *Store) verifyManifest(manifest syncmodel.Manifest) error {
+func (s *Store) verifyManifest(accountID string, manifest syncmodel.Manifest) error {
 	if len(manifest.Chunks) == 0 {
 		if manifest.Size != 0 {
 			return errors.New("empty chunk list with non-zero size")
@@ -330,6 +936,9 @@ func (s *Store) verifyManifest(manifest syncmodel.Manifest) error {
 		if manifest.Hash != fileutil.HashBytes(nil) {
 			return errors.New("empty file hash mismatch")
 		}
+		s.mu.Lock()
+		s.state.AccountChunks[accountChunkKey(accountID, manifest.Hash)] = true
+		s.mu.Unlock()
 		return nil
 	}
 	h := sha256.New()
@@ -340,6 +949,9 @@ func (s *Store) verifyManifest(manifest syncmodel.Manifest) error {
 		}
 		if !isHash(chunk.Hash) {
 			return fmt.Errorf("invalid chunk hash %q", chunk.Hash)
+		}
+		if !s.HasAccountChunk(accountID, chunk.Hash) {
+			return fmt.Errorf("chunk %s is not available to this account", chunk.Hash)
 		}
 		p, err := s.ChunkPath(chunk.Hash)
 		if err != nil {
@@ -377,6 +989,8 @@ func (s *Store) verifyManifest(manifest syncmodel.Manifest) error {
 func (s *Store) appendEventLocked(version syncmodel.FileVersion) {
 	s.state.LastEventSeq++
 	event := syncmodel.Event{
+		AccountID: version.AccountID,
+		SpaceID:   version.SpaceID,
 		Seq:       s.state.LastEventSeq,
 		Path:      version.Path,
 		FileID:    version.FileID,
@@ -403,10 +1017,52 @@ func (s *Store) nextConflictPathLocked(path, deviceID string, ts int64) string {
 	}, deviceID)
 	base := fmt.Sprintf("%s (conflict from %s at %s)%s", stem, safeDevice, time.Unix(ts, 0).Format("20060102-150405"), ext)
 	candidate := base
-	for i := 2; s.state.Files[candidate] != nil; i++ {
+	for i := 2; s.conflictPathExistsLocked(path, candidate); i++ {
 		candidate = fmt.Sprintf("%s (conflict %d from %s at %s)%s", stem, i, safeDevice, time.Unix(ts, 0).Format("20060102-150405"), ext)
 	}
 	return filepath.ToSlash(candidate)
+}
+
+func (s *Store) conflictPathExistsLocked(_, candidate string) bool {
+	for _, entry := range s.state.Files {
+		if entry.Path == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func fileKey(accountID, spaceID, path string) string {
+	return accountID + "\x00" + spaceID + "\x00" + path
+}
+
+func operationKey(accountID, spaceID, operationID string) string {
+	return accountID + "\x00" + spaceID + "\x00" + operationID
+}
+
+func accountChunkKey(accountID, hash string) string {
+	return accountID + "\x00" + hash
+}
+
+func spaceKey(accountID, spaceID string) string {
+	return accountID + "\x00" + spaceID
+}
+
+func folderKey(accountID, deviceID, rootPath string) string {
+	return accountID + "\x00" + strings.TrimSpace(deviceID) + "\x00" + strings.TrimSpace(rootPath)
+}
+
+func validAccountName(v string) bool {
+	if len(v) < 3 || len(v) > 64 {
+		return false
+	}
+	for _, r := range v {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func isHash(v string) bool {

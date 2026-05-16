@@ -14,19 +14,37 @@ import (
 )
 
 type API struct {
-	base   string
-	token  string
-	client *http.Client
+	base     string
+	token    string
+	space    string
+	deviceID string
+	rootPath string
+	client   *http.Client
 }
 
-func NewAPI(base, token string) *API {
+func NewAPI(base, token, space, deviceID, rootPath string) *API {
 	return &API{
-		base:  strings.TrimRight(base, "/"),
-		token: token,
+		base:     strings.TrimRight(base, "/"),
+		token:    token,
+		space:    space,
+		deviceID: deviceID,
+		rootPath: rootPath,
 		client: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
 	}
+}
+
+func (a *API) SetSyncContext(space, deviceID, rootPath string) {
+	a.space = space
+	a.deviceID = deviceID
+	a.rootPath = rootPath
+}
+
+func (a *API) ReportFolder(req syncmodel.FolderReportRequest) (syncmodel.FolderReportResponse, error) {
+	var resp syncmodel.FolderReportResponse
+	err := a.doJSON(http.MethodPost, "/v1/folders/report", req, &resp)
+	return resp, err
 }
 
 func (a *API) ListFiles() ([]syncmodel.FileEntry, error) {
@@ -135,5 +153,14 @@ func (a *API) doJSON(method, path string, in any, out any) error {
 func (a *API) auth(req *http.Request) {
 	if a.token != "" {
 		req.Header.Set("Authorization", "Bearer "+a.token)
+	}
+	if a.space != "" {
+		req.Header.Set("X-XCloud-Space", a.space)
+	}
+	if a.deviceID != "" {
+		req.Header.Set("X-XCloud-Device", a.deviceID)
+	}
+	if a.rootPath != "" {
+		req.Header.Set("X-XCloud-Root", a.rootPath)
 	}
 }
