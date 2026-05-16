@@ -78,6 +78,11 @@ For a single sync cycle:
 `-space` is a suggested Space for the folder report. The effective Space is the
 one selected by the gateway in the management console.
 
+`-root` is optional. Without it, the client reports discoverable local folders
+such as the current working directory and common user folders, then syncs only
+the folders selected by the gateway. With `-root`, it runs in compatibility mode
+for one explicit folder.
+
 Local deletes are conservative by default. To propagate local deletes to the
 server, run the client with:
 

@@ -757,7 +757,8 @@ const dashboardHTML = `<!doctype html>
           <section class="panel" style="margin-top:18px">
             <h2>客户端命令</h2>
             <p class="muted">客户端启动后会先上报本机目录。网关选择目录前，客户端不会上传或下载文件。-space 只是建议分组，实际同步 Space 由这里选择。</p>
-            <div class="cmd">./xcloud client -root /path/to/folder -server http://127.0.0.1:8080 -token &lt;账号token&gt; -space default</div>
+            <div class="cmd">./xcloud client -server http://127.0.0.1:8080 -token &lt;账号token&gt; -space default</div>
+            <p class="muted">也可以加 -root /path/to/folder 只上报并同步单个目录。</p>
           </section>
         </section>
 

@@ -68,6 +68,7 @@ type FileVersion struct {
 	ModTimeUnix int64      `json:"mod_time_unix,omitempty"`
 	DeletedAt   int64      `json:"deleted_at,omitempty"`
 	DeviceID    string     `json:"device_id"`
+	RootPath    string     `json:"root_path,omitempty"`
 	CreatedAt   int64      `json:"created_at"`
 }
 
@@ -117,6 +118,7 @@ type Event struct {
 	VersionID string      `json:"version_id"`
 	State     string      `json:"state"`
 	DeviceID  string      `json:"device_id"`
+	RootPath  string      `json:"root_path,omitempty"`
 	CreatedAt int64       `json:"created_at"`
 	Version   FileVersion `json:"version"`
 }
@@ -155,6 +157,7 @@ type CheckChunksResponse struct {
 type CommitRequest struct {
 	OperationID string   `json:"operation_id"`
 	DeviceID    string   `json:"device_id"`
+	RootPath    string   `json:"root_path,omitempty"`
 	Manifest    Manifest `json:"manifest"`
 }
 
@@ -170,6 +173,7 @@ type CommitResponse struct {
 type DeleteRequest struct {
 	OperationID string `json:"operation_id"`
 	DeviceID    string `json:"device_id"`
+	RootPath    string `json:"root_path,omitempty"`
 	Path        string `json:"path"`
 	FileID      string `json:"file_id,omitempty"`
 	BaseVersion string `json:"base_version,omitempty"`

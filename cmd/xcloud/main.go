@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -63,12 +62,12 @@ func runServer(args []string, log *slog.Logger) error {
 
 func runClient(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
-	root := fs.String("root", "", "directory to sync")
+	root := fs.String("root", "", "directory to sync; when omitted, report discoverable local folders and sync selected ones")
 	serverURL := fs.String("server", "http://127.0.0.1:8080", "server URL")
 	token := fs.String("token", env("XCLOUD_TOKEN", ""), "account sync token; can also use XCLOUD_TOKEN")
 	spaceID := fs.String("space", env("XCLOUD_SPACE", "default"), "suggested sync space ID for gateway selection; can also use XCLOUD_SPACE")
 	deviceID := fs.String("device", env("XCLOUD_DEVICE_ID", ""), "device ID; defaults to hostname")
-	statePath := fs.String("state", "", "client state file; defaults to <root>/.xcloud/state.json")
+	statePath := fs.String("state", "", "client state file for single-root mode; defaults to <root>/.xcloud/state.json")
 	interval := fs.Duration("interval", 10*time.Second, "sync interval")
 	chunkSize := fs.Int("chunk-size", syncmodel.DefaultChunkSize, "chunk size in bytes")
 	once := fs.Bool("once", false, "run one sync cycle and exit")
@@ -76,15 +75,9 @@ func runClient(args []string, log *slog.Logger) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *root == "" {
-		return fmt.Errorf("-root is required")
-	}
-	if *statePath == "" {
-		*statePath = filepath.Join(*root, ".xcloud", "state.json")
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	engine, err := client.NewEngine(client.Config{
+	cfg := client.Config{
 		Root:         *root,
 		StatePath:    *statePath,
 		ServerURL:    *serverURL,
@@ -96,11 +89,20 @@ func runClient(args []string, log *slog.Logger) error {
 		Once:         *once,
 		DeleteRemote: *deleteRemote,
 		Log:          log,
-	})
+	}
+	if *root == "" {
+		supervisor, err := client.NewSupervisor(cfg)
+		if err != nil {
+			return err
+		}
+		log.Info("xcloud client started", "mode", "discover", "server", *serverURL, "suggested_space", *spaceID, "interval", *interval)
+		return supervisor.Run(ctx)
+	}
+	engine, err := client.NewEngine(cfg)
 	if err != nil {
 		return err
 	}
-	log.Info("xcloud client started", "root", *root, "server", *serverURL, "suggested_space", *spaceID, "interval", *interval)
+	log.Info("xcloud client started", "mode", "single-root", "root", *root, "server", *serverURL, "suggested_space", *spaceID, "interval", *interval)
 	return engine.Run(ctx)
 }
 
@@ -109,11 +111,12 @@ func usage() {
 
 Usage:
   xcloud server -addr :8080 -data ./xcloud-data
+  xcloud client -server http://127.0.0.1:8080 -token account-token
   xcloud client -root ./docs -server http://127.0.0.1:8080 -token account-token -space default
 
 Commands:
   server    start the central sync server
-  client    report and sync one local directory after gateway selection
+  client    report local folders and sync selected folders after gateway selection
 
 `)
 }

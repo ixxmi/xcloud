@@ -38,6 +38,13 @@ type Engine struct {
 	log   *slog.Logger
 }
 
+type Supervisor struct {
+	cfg     Config
+	api     *API
+	engines map[string]*Engine
+	log     *slog.Logger
+}
+
 type localScanEntry struct {
 	Path        string
 	AbsPath     string
@@ -48,9 +55,55 @@ type localScanEntry struct {
 }
 
 func NewEngine(cfg Config) (*Engine, error) {
-	if cfg.Root == "" {
-		return nil, errors.New("root is required")
+	if cfg.ServerURL == "" {
+		return nil, errors.New("server URL is required")
 	}
+	if cfg.Root == "" {
+		return nil, errors.New("root is required for single-folder sync")
+	}
+	if cfg.SpaceID == "" {
+		cfg.SpaceID = "default"
+	}
+	if cfg.DeviceID == "" {
+		host, _ := os.Hostname()
+		if host == "" {
+			host = "device"
+		}
+		cfg.DeviceID = host
+	}
+	if cfg.Interval <= 0 {
+		cfg.Interval = 10 * time.Second
+	}
+	if cfg.ChunkSize <= 0 {
+		cfg.ChunkSize = syncmodel.DefaultChunkSize
+	}
+	if cfg.Log == nil {
+		cfg.Log = slog.Default()
+	}
+	rootAbs, err := filepath.Abs(cfg.Root)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Root = rootAbs
+	if cfg.StatePath == "" {
+		cfg.StatePath = filepath.Join(cfg.Root, ".xcloud", "state.json")
+	}
+	state, err := OpenState(cfg.StatePath)
+	if err != nil {
+		return nil, err
+	}
+	if err := state.SeedSpace(cfg.SpaceID); err != nil {
+		return nil, err
+	}
+	return &Engine{
+		cfg:   cfg,
+		api:   NewAPI(cfg.ServerURL, cfg.Token, cfg.SpaceID, cfg.DeviceID, cfg.Root),
+		state: state,
+		log:   cfg.Log,
+	}, nil
+}
+
+func NewSupervisor(cfg Config) (*Supervisor, error) {
 	if cfg.ServerURL == "" {
 		return nil, errors.New("server URL is required")
 	}
@@ -70,30 +123,99 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if cfg.ChunkSize <= 0 {
 		cfg.ChunkSize = syncmodel.DefaultChunkSize
 	}
-	if cfg.StatePath == "" {
-		cfg.StatePath = filepath.Join(cfg.Root, ".xcloud", "state.json")
-	}
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	rootAbs, err := filepath.Abs(cfg.Root)
-	if err != nil {
-		return nil, err
-	}
-	cfg.Root = rootAbs
-	state, err := OpenState(cfg.StatePath)
-	if err != nil {
-		return nil, err
-	}
-	if err := state.SeedSpace(cfg.SpaceID); err != nil {
-		return nil, err
-	}
-	return &Engine{
-		cfg:   cfg,
-		api:   NewAPI(cfg.ServerURL, cfg.Token, cfg.SpaceID, cfg.DeviceID, cfg.Root),
-		state: state,
-		log:   cfg.Log,
+	return &Supervisor{
+		cfg:     cfg,
+		api:     NewAPI(cfg.ServerURL, cfg.Token, cfg.SpaceID, cfg.DeviceID, ""),
+		engines: map[string]*Engine{},
+		log:     cfg.Log,
 	}, nil
+}
+
+func (s *Supervisor) Run(ctx context.Context) error {
+	if s.cfg.Once {
+		return s.SyncOnce(ctx)
+	}
+	ticker := time.NewTicker(s.cfg.Interval)
+	defer ticker.Stop()
+	for {
+		if err := s.SyncOnce(ctx); err != nil {
+			s.log.Error("sync failed", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Supervisor) SyncOnce(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	candidates, err := discoverFolders()
+	if err != nil {
+		return err
+	}
+	host, _ := os.Hostname()
+	selected := 0
+	for _, root := range candidates {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		resp, err := s.api.ReportFolder(syncmodel.FolderReportRequest{
+			DeviceID:         s.cfg.DeviceID,
+			Hostname:         host,
+			RootPath:         root,
+			SuggestedSpaceID: s.cfg.SpaceID,
+		})
+		if err != nil {
+			return err
+		}
+		if !resp.Selected || resp.Space == nil {
+			s.log.Info("client folder reported; waiting for gateway selection",
+				"device", s.cfg.DeviceID,
+				"root", root,
+				"suggested_space", s.cfg.SpaceID,
+				"status", resp.Folder.Status,
+			)
+			continue
+		}
+		selected++
+		engine, err := s.engineFor(root, resp.Space.ID)
+		if err != nil {
+			return err
+		}
+		if err := engine.SyncOnce(ctx); err != nil {
+			return err
+		}
+	}
+	if len(candidates) == 0 {
+		s.log.Info("no local folders discovered for reporting")
+	} else if selected == 0 {
+		s.log.Info("no selected folders yet; waiting for gateway selection", "candidates", len(candidates))
+	}
+	return nil
+}
+
+func (s *Supervisor) engineFor(root, spaceID string) (*Engine, error) {
+	key := root + "\x00" + spaceID
+	if engine := s.engines[key]; engine != nil {
+		return engine, nil
+	}
+	cfg := s.cfg
+	cfg.Root = root
+	cfg.SpaceID = spaceID
+	cfg.StatePath = filepath.Join(root, ".xcloud", "state-"+safeStateName(spaceID)+".json")
+	engine, err := NewEngine(cfg)
+	if err != nil {
+		return nil, err
+	}
+	s.engines[key] = engine
+	return engine, nil
 }
 
 func (e *Engine) Run(ctx context.Context) error {
@@ -207,6 +329,7 @@ func (e *Engine) pushLocal(ctx context.Context) error {
 		resp, err := e.api.Delete(syncmodel.DeleteRequest{
 			OperationID: fileutil.NewID(),
 			DeviceID:    e.cfg.DeviceID,
+			RootPath:    e.cfg.Root,
 			Path:        rel,
 			FileID:      known.FileID,
 			BaseVersion: known.VersionID,
@@ -259,6 +382,7 @@ func (e *Engine) uploadFile(ctx context.Context, entry localScanEntry, known syn
 	req := syncmodel.CommitRequest{
 		OperationID: fileutil.NewID(),
 		DeviceID:    e.cfg.DeviceID,
+		RootPath:    e.cfg.Root,
 		Manifest: syncmodel.Manifest{
 			FileID:      known.FileID,
 			Path:        entry.Path,
@@ -303,7 +427,7 @@ func (e *Engine) pullRemote(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if event.DeviceID == e.cfg.DeviceID {
+		if event.DeviceID == e.cfg.DeviceID && event.RootPath == e.cfg.Root {
 			if err := e.state.SetLastEventSeq(event.Seq); err != nil {
 				return err
 			}
@@ -496,6 +620,96 @@ func conflictLocalPath(path, deviceID string) string {
 		return '-'
 	}, deviceID)
 	return fmt.Sprintf("%s (local conflict from %s at %s)%s", stem, safeDevice, time.Now().Format("20060102-150405"), ext)
+}
+
+func discoverFolders() ([]string, error) {
+	seen := map[string]bool{}
+	out := []string{}
+	add := func(path string) {
+		if path == "" {
+			return
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return
+		}
+		info, err := os.Stat(abs)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return
+		}
+		if seen[abs] || shouldSkipDiscoveredDir(filepath.Base(abs)) {
+			return
+		}
+		seen[abs] = true
+		out = append(out, abs)
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		add(cwd)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		for _, name := range commonFolderNames() {
+			add(filepath.Join(home, name))
+		}
+		entries, err := os.ReadDir(home)
+		if err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+				info, err := entry.Info()
+				if err != nil || info.Mode()&os.ModeSymlink != 0 {
+					continue
+				}
+				add(filepath.Join(home, entry.Name()))
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func commonFolderNames() []string {
+	return []string{
+		"Desktop",
+		"Documents",
+		"Downloads",
+		"Pictures",
+		"Projects",
+		"Work",
+		"桌面",
+		"文稿",
+		"下载",
+		"图片",
+	}
+}
+
+func shouldSkipDiscoveredDir(name string) bool {
+	if name == "" {
+		return true
+	}
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+	switch name {
+	case "Applications", "Library", "Movies", "Music", "Public", "go", "node_modules":
+		return true
+	default:
+		return false
+	}
+}
+
+func safeStateName(v string) string {
+	out := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return '-'
+	}, v)
+	out = strings.Trim(out, "-")
+	if out == "" {
+		return "default"
+	}
+	return out
 }
 
 func stateFromVersion(version syncmodel.FileVersion) syncmodel.LocalFileState {

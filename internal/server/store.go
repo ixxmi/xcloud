@@ -224,6 +224,10 @@ func (s *Store) migrateLegacyScopeLocked(accountID, spaceID string) bool {
 			s.state.Events[i].SpaceID = spaceID
 			changed = true
 		}
+		if s.state.Events[i].RootPath == "" && s.state.Events[i].Version.RootPath != "" {
+			s.state.Events[i].RootPath = s.state.Events[i].Version.RootPath
+			changed = true
+		}
 	}
 	for hash := range s.state.ChunkRefs {
 		key := accountChunkKey(accountID, hash)
@@ -754,6 +758,7 @@ func (s *Store) Commit(accountID, spaceID string, req syncmodel.CommitRequest) (
 	if req.DeviceID == "" {
 		return syncmodel.CommitResponse{}, errors.New("device_id is required")
 	}
+	req.RootPath = strings.TrimSpace(req.RootPath)
 	manifest := req.Manifest
 	if manifest.Path == "" || manifest.Hash == "" {
 		return syncmodel.CommitResponse{}, errors.New("manifest path and hash are required")
@@ -823,6 +828,7 @@ func (s *Store) Commit(accountID, spaceID string, req syncmodel.CommitRequest) (
 		Chunks:      append([]syncmodel.ChunkRef(nil), manifest.Chunks...),
 		ModTimeUnix: manifest.ModTimeUnix,
 		DeviceID:    req.DeviceID,
+		RootPath:    req.RootPath,
 		CreatedAt:   now,
 	}
 	entry.Current = &version
@@ -857,6 +863,7 @@ func (s *Store) Delete(accountID, spaceID string, req syncmodel.DeleteRequest) (
 	if req.DeviceID == "" {
 		return syncmodel.CommitResponse{}, errors.New("device_id is required")
 	}
+	req.RootPath = strings.TrimSpace(req.RootPath)
 	if req.Path == "" {
 		return syncmodel.CommitResponse{}, errors.New("path is required")
 	}
@@ -907,6 +914,7 @@ func (s *Store) Delete(accountID, spaceID string, req syncmodel.DeleteRequest) (
 		State:       syncmodel.EntryDeleted,
 		DeletedAt:   now,
 		DeviceID:    req.DeviceID,
+		RootPath:    req.RootPath,
 		CreatedAt:   now,
 	}
 	entry.Current = &version
@@ -997,6 +1005,7 @@ func (s *Store) appendEventLocked(version syncmodel.FileVersion) {
 		VersionID: version.VersionID,
 		State:     version.State,
 		DeviceID:  version.DeviceID,
+		RootPath:  version.RootPath,
 		CreatedAt: version.CreatedAt,
 		Version:   version,
 	}
