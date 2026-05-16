@@ -41,6 +41,7 @@ type Engine struct {
 type Supervisor struct {
 	cfg     Config
 	api     *API
+	state   *State
 	engines map[string]*Engine
 	log     *slog.Logger
 }
@@ -126,9 +127,17 @@ func NewSupervisor(cfg Config) (*Supervisor, error) {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
+	if cfg.StatePath == "" {
+		cfg.StatePath = filepath.Join(clientStateRoot(), ".xcloud", "discovery-state.json")
+	}
+	state, err := OpenState(cfg.StatePath)
+	if err != nil {
+		return nil, err
+	}
 	return &Supervisor{
 		cfg:     cfg,
 		api:     NewAPI(cfg.ServerURL, cfg.Token, cfg.SpaceID, cfg.DeviceID, ""),
+		state:   state,
 		engines: map[string]*Engine{},
 		log:     cfg.Log,
 	}, nil
@@ -156,23 +165,45 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	candidates, err := discoverFolders()
+	candidates, err := discoverRootFolders()
 	if err != nil {
 		return err
 	}
 	host, _ := os.Hostname()
+	status, err := s.api.FolderStatus()
+	if err != nil {
+		return err
+	}
+	for _, req := range status.Requests {
+		if err := s.reportChildren(host, req); err != nil {
+			return err
+		}
+	}
+	for _, folder := range status.Selected {
+		if !containsString(candidates, folder.RootPath) {
+			candidates = append(candidates, folder.RootPath)
+		}
+	}
+	sort.Strings(candidates)
 	selected := 0
 	for _, root := range candidates {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if s.state.DirReported(root) {
+			continue
+		}
 		resp, err := s.api.ReportFolder(syncmodel.FolderReportRequest{
 			DeviceID:         s.cfg.DeviceID,
 			Hostname:         host,
 			RootPath:         root,
+			Depth:            0,
 			SuggestedSpaceID: s.cfg.SpaceID,
 		})
 		if err != nil {
+			return err
+		}
+		if err := s.state.MarkDirReported(root); err != nil {
 			return err
 		}
 		if !resp.Selected || resp.Space == nil {
@@ -184,8 +215,14 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 			)
 			continue
 		}
+	}
+	status, err = s.api.FolderStatus()
+	if err != nil {
+		return err
+	}
+	for _, folder := range status.Selected {
 		selected++
-		engine, err := s.engineFor(root, resp.Space.ID)
+		engine, err := s.engineFor(folder.RootPath, folder.SpaceID)
 		if err != nil {
 			return err
 		}
@@ -199,6 +236,40 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 		s.log.Info("no selected folders yet; waiting for gateway selection", "candidates", len(candidates))
 	}
 	return nil
+}
+
+func (s *Supervisor) reportChildren(host string, req syncmodel.FolderDiscoveryRequest) error {
+	children, err := discoverChildFolders(req.RootPath)
+	if err != nil {
+		s.log.Warn("cannot discover child folders", "root", req.RootPath, "err", err)
+		return s.api.ChildrenComplete(syncmodel.FolderChildrenCompleteRequest{
+			DeviceID: s.cfg.DeviceID,
+			RootPath: req.RootPath,
+		})
+	}
+	for _, child := range children {
+		if s.state.DirReported(child) {
+			continue
+		}
+		if _, err := s.api.ReportFolder(syncmodel.FolderReportRequest{
+			DeviceID:         s.cfg.DeviceID,
+			Hostname:         host,
+			RootPath:         child,
+			ParentPath:       req.RootPath,
+			Depth:            req.Depth,
+			SuggestedSpaceID: s.cfg.SpaceID,
+		}); err != nil {
+			return err
+		}
+		if err := s.state.MarkDirReported(child); err != nil {
+			return err
+		}
+		s.log.Info("reported child folder", "parent", req.RootPath, "root", child)
+	}
+	return s.api.ChildrenComplete(syncmodel.FolderChildrenCompleteRequest{
+		DeviceID: s.cfg.DeviceID,
+		RootPath: req.RootPath,
+	})
 }
 
 func (s *Supervisor) engineFor(root, spaceID string) (*Engine, error) {
@@ -622,7 +693,7 @@ func conflictLocalPath(path, deviceID string) string {
 	return fmt.Sprintf("%s (local conflict from %s at %s)%s", stem, safeDevice, time.Now().Format("20060102-150405"), ext)
 }
 
-func discoverFolders() ([]string, error) {
+func discoverRootFolders() ([]string, error) {
 	seen := map[string]bool{}
 	out := []string{}
 	add := func(path string) {
@@ -647,40 +718,38 @@ func discoverFolders() ([]string, error) {
 		add(cwd)
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		for _, name := range commonFolderNames() {
-			add(filepath.Join(home, name))
-		}
-		entries, err := os.ReadDir(home)
-		if err == nil {
-			for _, entry := range entries {
-				if !entry.IsDir() {
-					continue
-				}
-				info, err := entry.Info()
-				if err != nil || info.Mode()&os.ModeSymlink != 0 {
-					continue
-				}
-				add(filepath.Join(home, entry.Name()))
-			}
-		}
+		add(home)
 	}
 	sort.Strings(out)
 	return out, nil
 }
 
-func commonFolderNames() []string {
-	return []string{
-		"Desktop",
-		"Documents",
-		"Downloads",
-		"Pictures",
-		"Projects",
-		"Work",
-		"桌面",
-		"文稿",
-		"下载",
-		"图片",
+func discoverChildFolders(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
 	}
+	out := []string{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if shouldSkipDiscoveredDir(name) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		abs, err := filepath.Abs(filepath.Join(root, name))
+		if err != nil {
+			continue
+		}
+		out = append(out, abs)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func shouldSkipDiscoveredDir(name string) bool {
@@ -696,6 +765,25 @@ func shouldSkipDiscoveredDir(name string) bool {
 	default:
 		return false
 	}
+}
+
+func containsString(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func clientStateRoot() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return home
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		return cwd
+	}
+	return "."
 }
 
 func safeStateName(v string) string {

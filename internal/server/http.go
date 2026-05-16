@@ -59,8 +59,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/spaces/toggle", s.requireLogin(s.adminToggleSpace))
 	mux.HandleFunc("POST /admin/folders/select", s.requireLogin(s.adminSelectFolder))
 	mux.HandleFunc("POST /admin/folders/disable", s.requireLogin(s.adminDisableFolder))
+	mux.HandleFunc("POST /admin/folders/expand", s.requireLogin(s.adminExpandFolder))
 
 	mux.HandleFunc("POST /v1/folders/report", s.syncAuth(s.reportFolder))
+	mux.HandleFunc("GET /v1/folders/status", s.syncAuth(s.folderStatus))
+	mux.HandleFunc("POST /v1/folders/children-complete", s.syncAuth(s.childrenComplete))
 	mux.HandleFunc("GET /v1/files", s.syncAuth(s.listFiles))
 	mux.HandleFunc("GET /v1/events", s.syncAuth(s.events))
 	mux.HandleFunc("POST /v1/chunks/check", s.syncAuth(s.checkChunks))
@@ -100,7 +103,7 @@ func (s *Server) syncAuth(next func(http.ResponseWriter, *http.Request, syncCont
 		}
 		deviceID := strings.TrimSpace(r.Header.Get("X-XCloud-Device"))
 		rootPath := strings.TrimSpace(r.Header.Get("X-XCloud-Root"))
-		if r.URL.Path != "/v1/folders/report" {
+		if r.URL.Path != "/v1/folders/report" && r.URL.Path != "/v1/folders/status" && r.URL.Path != "/v1/folders/children-complete" {
 			if deviceID == "" || rootPath == "" {
 				writeJSON(w, http.StatusForbidden, syncmodel.ErrorResponse{Error: "client folder has not been reported"})
 				return
@@ -132,6 +135,25 @@ func (s *Server) reportFolder(w http.ResponseWriter, r *http.Request, ctx syncCo
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) folderStatus(w http.ResponseWriter, _ *http.Request, ctx syncContext) {
+	writeJSON(w, http.StatusOK, s.store.FolderStatus(ctx.account.ID, ctx.deviceID))
+}
+
+func (s *Server) childrenComplete(w http.ResponseWriter, r *http.Request, ctx syncContext) {
+	var req syncmodel.FolderChildrenCompleteRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.DeviceID == "" {
+		req.DeviceID = ctx.deviceID
+	}
+	if err := s.store.MarkChildrenReported(ctx.account.ID, req.DeviceID, req.RootPath); err != nil {
+		writeJSON(w, http.StatusBadRequest, syncmodel.ErrorResponse{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) listFiles(w http.ResponseWriter, _ *http.Request, ctx syncContext) {
@@ -442,6 +464,26 @@ func (s *Server) adminDisableFolder(w http.ResponseWriter, r *http.Request, acco
 	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "客户端目录已停用"})
 }
 
+func (s *Server) adminExpandFolder(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
+	if err := r.ParseForm(); err != nil {
+		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()})
+		return
+	}
+	accountID := r.Form.Get("account_id")
+	if accountID == "" {
+		accountID = account.ID
+	}
+	if accountID != account.ID && !account.IsAdmin {
+		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: "没有权限展开其他账号的客户端目录"})
+		return
+	}
+	if err := s.store.RequestChildren(accountID, r.Form.Get("folder_id")); err != nil {
+		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()})
+		return
+	}
+	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "已请求客户端上报下一级目录，客户端下一轮同步后会出现在列表中"})
+}
+
 func (s *Server) requireLogin(next func(http.ResponseWriter, *http.Request, syncmodel.Account)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		account, ok := s.sessionAccount(r)
@@ -523,6 +565,8 @@ func (s *Server) renderDashboard(w http.ResponseWriter, account syncmodel.Accoun
 	type folderView struct {
 		Folder syncmodel.ClientFolder
 		Spaces []syncmodel.SpaceSummary
+		Indent int
+		Base   string
 	}
 	type spaceGroup struct {
 		Account syncmodel.Account
@@ -539,7 +583,12 @@ func (s *Server) renderDashboard(w http.ResponseWriter, account syncmodel.Accoun
 		folders := s.store.ListFolders(item.ID)
 		folderViews := make([]folderView, 0, len(folders))
 		for _, folder := range folders {
-			folderViews = append(folderViews, folderView{Folder: folder, Spaces: spaces})
+			folderViews = append(folderViews, folderView{
+				Folder: folder,
+				Spaces: spaces,
+				Indent: folder.Depth * 18,
+				Base:   pathBase(folder.RootPath),
+			})
 		}
 		for _, summary := range spaces {
 			totalSpaces++
@@ -601,6 +650,18 @@ func fmtSscanf(v string, out *int64) (int, error) {
 	}
 	*out = n * sign
 	return 1, nil
+}
+
+func pathBase(path string) string {
+	path = strings.TrimRight(strings.ReplaceAll(path, "\\", "/"), "/")
+	if path == "" {
+		return "/"
+	}
+	idx := strings.LastIndex(path, "/")
+	if idx >= 0 && idx < len(path)-1 {
+		return path[idx+1:]
+	}
+	return path
 }
 
 const authHTML = `<!doctype html>
@@ -707,6 +768,7 @@ const dashboardHTML = `<!doctype html>
     .nav{padding:18px 14px;flex:1}.nav p{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#64748b;margin:10px 8px}.nav button{width:100%;height:40px;display:flex;align-items:center;gap:10px;padding:0 10px;border-radius:8px;color:#cbd5e1;text-decoration:none;font-size:14px;margin:4px 0;background:transparent;border:0;font-weight:700;cursor:pointer;text-align:left}.nav button.active{background:#1d4ed8;color:#fff}.nav button:not(.active):hover{background:#1e293b;color:#fff}.logout{padding:16px;border-top:1px solid #1e293b}.logout button{width:100%;height:38px;border:0;border-radius:8px;background:#1e293b;color:#e2e8f0;font-weight:700;cursor:pointer}
     .main{margin-left:252px;min-width:0;flex:1}.top{height:64px;background:#fff;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between;padding:0 26px;position:sticky;top:0;z-index:5}.search{height:38px;width:min(360px,48vw);display:flex;align-items:center;gap:8px;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:8px;padding:0 12px;color:#64748b}.search input{border:0;background:transparent;outline:none;width:100%;font-size:14px}.user{display:flex;align-items:center;gap:12px}.avatar{width:34px;height:34px;border-radius:50%;background:#2563eb;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800}.content{padding:28px;max-width:1280px;margin:0 auto}.hero{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:22px}.hero h1{font-size:26px;margin:0 0 6px;letter-spacing:0}.muted{color:#667085;font-size:13px;line-height:1.6}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.stat{background:#fff;border:1px solid #e6eaf0;border-radius:8px;padding:18px}.stat .label{font-size:13px;color:#667085;margin-bottom:8px}.stat strong{font-size:28px}.stat .hint{font-size:12px;color:#0f766e;margin-top:10px}
     .two{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.8fr);gap:18px;margin-top:18px}.panel{background:#fff;border:1px solid #e6eaf0;border-radius:8px;padding:18px;margin-bottom:18px}.panel h2{font-size:17px;margin:0 0 14px}.panel h3{font-size:15px;margin:20px 0 10px}.flash{border-radius:8px;padding:12px 14px;margin-bottom:18px;word-break:break-all;font-size:14px}.flash.success{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46}.flash.error{background:#fef2f2;border:1px solid #fecaca;color:#991b1b}
+    .folder-list{display:grid;gap:10px}.folder-card{border:1px solid #e2e8f0;border-radius:8px;background:linear-gradient(180deg,#fff,#fbfdff);padding:14px;transition:box-shadow .18s,border-color .18s,transform .18s}.folder-card:hover{border-color:#bfdbfe;box-shadow:0 10px 24px rgba(15,23,42,.08);transform:translateY(-1px)}.folder-main{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.folder-title{display:flex;align-items:center;gap:10px;font-weight:800}.folder-icon{width:30px;height:30px;border-radius:8px;background:#dbeafe;color:#1d4ed8;display:flex;align-items:center;justify-content:center}.folder-path{margin-top:8px;color:#475569;word-break:break-all}.folder-meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.folder-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}.folder-card.selected{border-color:#86efac}.folder-card.disabled{opacity:.68}.tree-line{border-left:2px solid #e2e8f0;padding-left:12px}.mini{font-size:12px;color:#64748b}.warn{background:#fef3c7;color:#92400e}
     table{width:100%;border-collapse:collapse;font-size:14px}th,td{border-bottom:1px solid #eef2f7;text-align:left;padding:10px 8px;vertical-align:top}th{font-size:12px;color:#667085;text-transform:uppercase;letter-spacing:.04em}code,.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.cmd{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:8px;padding:10px;word-break:break-all;color:#334155}
     label{display:block;font-size:13px;font-weight:700;margin:12px 0 6px}input,textarea,select{box-sizing:border-box;width:100%;border:1px solid #cbd5e1;border-radius:8px;padding:9px 10px;font-size:14px;background:#fff;color:#172033}textarea{min-height:72px;resize:vertical}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.inline{display:inline}
     button{border:0;border-radius:8px;background:#2563eb;color:#fff;font-weight:800;padding:9px 12px;cursor:pointer}.secondary{background:#eef2f7;color:#172033}.danger{background:#dc2626}.badge{display:inline-flex;align-items:center;height:24px;padding:0 8px;border-radius:999px;font-size:12px;font-weight:700;background:#eef2f7;color:#334155}.ok{background:#dcfce7;color:#166534}.off{background:#fee2e2;color:#991b1b}
@@ -773,38 +835,48 @@ const dashboardHTML = `<!doctype html>
                   <p class="muted">客户端上报的本地目录会先进入待选择状态。选择到某个 Space 后，同账号同 Space 的目录开始互相同步。</p>
                 </div>
               </div>
-              <table>
-                <thead><tr><th>设备</th><th>本地目录</th><th>建议 Space</th><th>当前 Space</th><th>状态</th><th>最后上报</th><th>操作</th></tr></thead>
-                <tbody>
-                  {{range .Folders}}
-                  <tr>
-                    <td><strong>{{.Folder.DeviceID}}</strong><br><span class="muted">{{.Folder.Hostname}}</span></td>
-                    <td class="path"><code>{{.Folder.RootPath}}</code></td>
-                    <td><code>{{.Folder.SuggestedSpaceID}}</code></td>
-                    <td>{{if .Folder.SpaceID}}<code>{{.Folder.SpaceID}}</code>{{else}}<span class="muted">未选择</span>{{end}}</td>
-                    <td>{{if eq .Folder.Status "selected"}}<span class="badge ok">已选择</span>{{else if eq .Folder.Status "disabled"}}<span class="badge off">已停用</span>{{else}}<span class="badge">待选择</span>{{end}}</td>
-                    <td>{{.Folder.LastSeenAt}}</td>
-                    <td>
+              <div class="folder-list">
+                {{range .Folders}}
+                {{$currentSpace := .Folder.SpaceID}}
+                <div class="folder-card {{if eq .Folder.Status "selected"}}selected{{end}} {{if eq .Folder.Status "disabled"}}disabled{{end}}" style="margin-left:{{.Indent}}px">
+                  <div class="folder-main">
+                    <div class="tree-line">
+                      <div class="folder-title"><span class="folder-icon">▤</span><span>{{.Base}}</span>{{if eq .Folder.Status "selected"}}<span class="badge ok">已选择</span>{{else if eq .Folder.Status "disabled"}}<span class="badge off">已停用</span>{{else}}<span class="badge">待选择</span>{{end}}</div>
+                      <div class="folder-path"><code>{{.Folder.RootPath}}</code></div>
+                      <div class="folder-meta">
+                        <span class="badge">设备 {{.Folder.DeviceID}}</span>
+                        <span class="badge">层级 {{.Folder.Depth}}</span>
+                        {{if .Folder.SpaceID}}<span class="badge ok">Space {{.Folder.SpaceID}}</span>{{else}}<span class="badge">未分配 Space</span>{{end}}
+                        {{if .Folder.ChildrenRequested}}{{if .Folder.ChildrenReported}}<span class="badge ok">下级已上报</span>{{else}}<span class="badge warn">等待下级上报</span>{{end}}{{end}}
+                      </div>
+                      <div class="mini">最后上报：{{.Folder.LastSeenAt}}{{if .Folder.ParentPath}} / 上级：{{.Folder.ParentPath}}{{end}}</div>
+                    </div>
+                    <div class="folder-actions">
                       <form class="inline actions" method="post" action="/admin/folders/select">
                         <input type="hidden" name="account_id" value="{{.Folder.AccountID}}">
                         <input type="hidden" name="folder_id" value="{{.Folder.ID}}">
                         <select class="small-select" name="space_id">
-                          {{range .Spaces}}<option value="{{.Space.ID}}">{{.Space.Name}}</option>{{end}}
+                          {{range .Spaces}}<option value="{{.Space.ID}}" {{if eq .Space.ID $currentSpace}}selected{{end}}>{{.Space.Name}}</option>{{end}}
                         </select>
-                        <button type="submit">选择</button>
+                        <button type="submit">选择同步</button>
+                      </form>
+                      <form class="inline" method="post" action="/admin/folders/expand">
+                        <input type="hidden" name="account_id" value="{{.Folder.AccountID}}">
+                        <input type="hidden" name="folder_id" value="{{.Folder.ID}}">
+                        <button class="secondary" type="submit">展开下一级</button>
                       </form>
                       <form class="inline" method="post" action="/admin/folders/disable">
                         <input type="hidden" name="account_id" value="{{.Folder.AccountID}}">
                         <input type="hidden" name="folder_id" value="{{.Folder.ID}}">
                         <button class="secondary" type="submit">停用</button>
                       </form>
-                    </td>
-                  </tr>
-                  {{else}}
-                  <tr><td colspan="7"><span class="muted">暂无客户端目录上报。启动客户端后会先出现在这里，选择到 Space 后才开始同步。</span></td></tr>
-                  {{end}}
-                </tbody>
-              </table>
+                    </div>
+                  </div>
+                </div>
+                {{else}}
+                <div class="folder-card"><span class="muted">暂无客户端目录上报。启动客户端后会先上报根级目录，展开后再逐级上报下一级。</span></div>
+                {{end}}
+              </div>
             </section>
             {{end}}
             </div>

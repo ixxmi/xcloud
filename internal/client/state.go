@@ -21,13 +21,15 @@ type StateData struct {
 	Files        map[string]syncmodel.LocalFileState `json:"files"`
 	LastEventSeq int64                               `json:"last_event_seq"`
 	SpaceID      string                              `json:"space_id,omitempty"`
+	ReportedDirs map[string]bool                     `json:"reported_dirs,omitempty"`
 }
 
 func OpenState(path string) (*State, error) {
 	st := &State{
 		path: path,
 		Data: StateData{
-			Files: map[string]syncmodel.LocalFileState{},
+			Files:        map[string]syncmodel.LocalFileState{},
+			ReportedDirs: map[string]bool{},
 		},
 	}
 	b, err := os.ReadFile(path)
@@ -44,6 +46,9 @@ func OpenState(path string) (*State, error) {
 	}
 	if st.Data.Files == nil {
 		st.Data.Files = map[string]syncmodel.LocalFileState{}
+	}
+	if st.Data.ReportedDirs == nil {
+		st.Data.ReportedDirs = map[string]bool{}
 	}
 	return st, nil
 }
@@ -100,6 +105,25 @@ func (s *State) SeedSpace(spaceID string) error {
 		return nil
 	}
 	s.Data.SpaceID = spaceID
+	return s.saveLocked()
+}
+
+func (s *State) DirReported(path string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Data.ReportedDirs[path]
+}
+
+func (s *State) MarkDirReported(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Data.ReportedDirs == nil {
+		s.Data.ReportedDirs = map[string]bool{}
+	}
+	if s.Data.ReportedDirs[path] {
+		return nil
+	}
+	s.Data.ReportedDirs[path] = true
 	return s.saveLocked()
 }
 

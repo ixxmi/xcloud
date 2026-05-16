@@ -47,6 +47,16 @@ func (a *API) ReportFolder(req syncmodel.FolderReportRequest) (syncmodel.FolderR
 	return resp, err
 }
 
+func (a *API) FolderStatus() (syncmodel.FolderStatusResponse, error) {
+	var resp syncmodel.FolderStatusResponse
+	err := a.doJSON(http.MethodGet, "/v1/folders/status", nil, &resp)
+	return resp, err
+}
+
+func (a *API) ChildrenComplete(req syncmodel.FolderChildrenCompleteRequest) error {
+	return a.doJSON(http.MethodPost, "/v1/folders/children-complete", req, nil)
+}
+
 func (a *API) ListFiles() ([]syncmodel.FileEntry, error) {
 	var resp syncmodel.ListResponse
 	if err := a.doJSON(http.MethodGet, "/v1/files", nil, &resp); err != nil {

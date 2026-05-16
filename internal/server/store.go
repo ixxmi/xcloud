@@ -189,6 +189,10 @@ func (s *Store) normalizeFoldersLocked() bool {
 			folder.Status = syncmodel.FolderPending
 			changed = true
 		}
+		if folder.Depth < 0 {
+			folder.Depth = 0
+			changed = true
+		}
 	}
 	return changed
 }
@@ -484,6 +488,7 @@ func (s *Store) ListSpaces(accountID string) []syncmodel.SpaceSummary {
 func (s *Store) ReportFolder(accountID string, req syncmodel.FolderReportRequest) (syncmodel.FolderReportResponse, error) {
 	deviceID := strings.TrimSpace(req.DeviceID)
 	rootPath := strings.TrimSpace(req.RootPath)
+	parentPath := strings.TrimSpace(req.ParentPath)
 	hostname := strings.TrimSpace(req.Hostname)
 	if deviceID == "" {
 		return syncmodel.FolderReportResponse{}, errors.New("device_id is required")
@@ -494,6 +499,10 @@ func (s *Store) ReportFolder(accountID string, req syncmodel.FolderReportRequest
 	suggestedSpaceID := strings.TrimSpace(req.SuggestedSpaceID)
 	if suggestedSpaceID == "" {
 		suggestedSpaceID = "default"
+	}
+	depth := req.Depth
+	if depth < 0 {
+		depth = 0
 	}
 	now := time.Now().Unix()
 	key := folderKey(accountID, deviceID, rootPath)
@@ -508,6 +517,8 @@ func (s *Store) ReportFolder(accountID string, req syncmodel.FolderReportRequest
 			DeviceID:         deviceID,
 			Hostname:         hostname,
 			RootPath:         rootPath,
+			ParentPath:       parentPath,
+			Depth:            depth,
 			SuggestedSpaceID: suggestedSpaceID,
 			Status:           syncmodel.FolderPending,
 			CreatedAt:        now,
@@ -515,6 +526,8 @@ func (s *Store) ReportFolder(accountID string, req syncmodel.FolderReportRequest
 		s.state.ClientFolders[key] = folder
 	} else {
 		folder.Hostname = hostname
+		folder.ParentPath = parentPath
+		folder.Depth = depth
 		folder.SuggestedSpaceID = suggestedSpaceID
 	}
 	folder.LastSeenAt = now
@@ -558,6 +571,77 @@ func (s *Store) ListFolders(accountID string) []syncmodel.ClientFolder {
 	return out
 }
 
+func (s *Store) FolderStatus(accountID, deviceID string) syncmodel.FolderStatusResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resp := syncmodel.FolderStatusResponse{}
+	for _, folder := range s.state.ClientFolders {
+		if folder.AccountID != accountID {
+			continue
+		}
+		if deviceID != "" && folder.DeviceID != deviceID {
+			continue
+		}
+		if folder.ChildrenRequested && !folder.ChildrenReported {
+			resp.Requests = append(resp.Requests, syncmodel.FolderDiscoveryRequest{
+				RootPath: folder.RootPath,
+				Depth:    folder.Depth + 1,
+			})
+		}
+		if folder.Status == syncmodel.FolderSelected && folder.SpaceID != "" {
+			resp.Selected = append(resp.Selected, *folder)
+		}
+	}
+	sort.Slice(resp.Requests, func(i, j int) bool {
+		return resp.Requests[i].RootPath < resp.Requests[j].RootPath
+	})
+	sort.Slice(resp.Selected, func(i, j int) bool {
+		return resp.Selected[i].RootPath < resp.Selected[j].RootPath
+	})
+	return resp
+}
+
+func (s *Store) RequestChildren(accountID, folderID string) error {
+	if folderID == "" {
+		return errors.New("folder_id is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, folder := range s.state.ClientFolders {
+		if folder.AccountID != accountID || folder.ID != folderID {
+			continue
+		}
+		now := time.Now().Unix()
+		folder.ChildrenRequested = true
+		folder.ChildrenReported = false
+		folder.ChildrenRequestedAt = now
+		folder.UpdatedAt = now
+		return s.saveLocked()
+	}
+	return errors.New("client folder not found")
+}
+
+func (s *Store) MarkChildrenReported(accountID, deviceID, rootPath string) error {
+	rootPath = strings.TrimSpace(rootPath)
+	if deviceID == "" {
+		return errors.New("device_id is required")
+	}
+	if rootPath == "" {
+		return errors.New("root_path is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	folder := s.state.ClientFolders[folderKey(accountID, deviceID, rootPath)]
+	if folder == nil {
+		return errors.New("client folder not found")
+	}
+	now := time.Now().Unix()
+	folder.ChildrenReported = true
+	folder.ChildrenReportedAt = now
+	folder.UpdatedAt = now
+	return s.saveLocked()
+}
+
 func (s *Store) SelectFolder(accountID, folderID, spaceID string) error {
 	if folderID == "" {
 		return errors.New("folder_id is required")
@@ -577,6 +661,9 @@ func (s *Store) SelectFolder(accountID, folderID, spaceID string) error {
 		}
 		folder.SpaceID = spaceID
 		folder.Status = syncmodel.FolderSelected
+		folder.ChildrenRequested = true
+		folder.ChildrenReported = false
+		folder.ChildrenRequestedAt = time.Now().Unix()
 		folder.UpdatedAt = time.Now().Unix()
 		return s.saveLocked()
 	}

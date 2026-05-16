@@ -35,17 +35,23 @@ type SyncSpace struct {
 }
 
 type ClientFolder struct {
-	ID               string `json:"id"`
-	AccountID        string `json:"account_id"`
-	DeviceID         string `json:"device_id"`
-	Hostname         string `json:"hostname,omitempty"`
-	RootPath         string `json:"root_path"`
-	SuggestedSpaceID string `json:"suggested_space_id,omitempty"`
-	SpaceID          string `json:"space_id,omitempty"`
-	Status           string `json:"status"`
-	LastSeenAt       int64  `json:"last_seen_at"`
-	CreatedAt        int64  `json:"created_at"`
-	UpdatedAt        int64  `json:"updated_at"`
+	ID                  string `json:"id"`
+	AccountID           string `json:"account_id"`
+	DeviceID            string `json:"device_id"`
+	Hostname            string `json:"hostname,omitempty"`
+	RootPath            string `json:"root_path"`
+	ParentPath          string `json:"parent_path,omitempty"`
+	Depth               int    `json:"depth"`
+	SuggestedSpaceID    string `json:"suggested_space_id,omitempty"`
+	SpaceID             string `json:"space_id,omitempty"`
+	Status              string `json:"status"`
+	ChildrenRequested   bool   `json:"children_requested,omitempty"`
+	ChildrenReported    bool   `json:"children_reported,omitempty"`
+	ChildrenRequestedAt int64  `json:"children_requested_at,omitempty"`
+	ChildrenReportedAt  int64  `json:"children_reported_at,omitempty"`
+	LastSeenAt          int64  `json:"last_seen_at"`
+	CreatedAt           int64  `json:"created_at"`
+	UpdatedAt           int64  `json:"updated_at"`
 }
 
 type ChunkRef struct {
@@ -127,13 +133,30 @@ type FolderReportRequest struct {
 	DeviceID         string `json:"device_id"`
 	Hostname         string `json:"hostname,omitempty"`
 	RootPath         string `json:"root_path"`
+	ParentPath       string `json:"parent_path,omitempty"`
+	Depth            int    `json:"depth,omitempty"`
 	SuggestedSpaceID string `json:"suggested_space_id,omitempty"`
+}
+
+type FolderDiscoveryRequest struct {
+	RootPath string `json:"root_path"`
+	Depth    int    `json:"depth"`
 }
 
 type FolderReportResponse struct {
 	Folder   ClientFolder `json:"folder"`
 	Space    *SyncSpace   `json:"space,omitempty"`
 	Selected bool         `json:"selected"`
+}
+
+type FolderStatusResponse struct {
+	Requests []FolderDiscoveryRequest `json:"requests"`
+	Selected []ClientFolder           `json:"selected"`
+}
+
+type FolderChildrenCompleteRequest struct {
+	DeviceID string `json:"device_id"`
+	RootPath string `json:"root_path"`
 }
 
 type Manifest struct {
