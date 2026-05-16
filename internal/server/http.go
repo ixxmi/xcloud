@@ -61,7 +61,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/folders/select", s.requireLogin(s.adminSelectFolder))
 	mux.HandleFunc("POST /admin/folders/disable", s.requireLogin(s.adminDisableFolder))
 	mux.HandleFunc("POST /admin/folders/expand", s.requireLogin(s.adminExpandFolder))
-	mux.HandleFunc("POST /admin/folders/set-path", s.requireLogin(s.adminSetFolderPath))
+	mux.HandleFunc("POST /admin/clients/storage-root", s.requireLogin(s.adminSetClientStorageRoot))
 	mux.HandleFunc("POST /admin/sync-settings/update", s.requireLogin(s.adminUpdateSyncSettings))
 
 	mux.HandleFunc("POST /v1/client/login", s.clientLogin)
@@ -262,7 +262,7 @@ func (s *Server) clientLogin(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	account, token, err := s.store.IssueClientToken(req.Identifier, req.Password, req.DeviceID, req.Hostname)
+	account, token, storageRoot, err := s.store.IssueClientToken(req.Identifier, req.Password, req.DeviceID, req.Hostname, req.StorageRoot)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, syncmodel.ErrorResponse{Error: err.Error()})
 		return
@@ -273,6 +273,7 @@ func (s *Server) clientLogin(w http.ResponseWriter, r *http.Request) {
 		SpaceID:     "default",
 		SyncEnabled: account.SyncEnabled,
 		Settings:    syncmodel.NormalizeSyncSettings(account.SyncSettings),
+		StorageRoot: storageRoot,
 	})
 }
 
@@ -290,13 +291,8 @@ func (s *Server) clientSyncToggle(w http.ResponseWriter, r *http.Request, accoun
 		writeJSON(w, http.StatusBadRequest, syncmodel.ErrorResponse{Error: err.Error()})
 		return
 	}
-	account.SyncEnabled = req.Enabled
-	writeJSON(w, http.StatusOK, syncmodel.ClientStatusResponse{
-		Account:     accountProfile(account),
-		SpaceID:     "default",
-		SyncEnabled: account.SyncEnabled,
-		Settings:    syncmodel.NormalizeSyncSettings(account.SyncSettings),
-	})
+	deviceID := strings.TrimSpace(r.Header.Get("X-XCloud-Device"))
+	writeJSON(w, http.StatusOK, s.store.ClientStatus(account.ID, deviceID))
 }
 
 func (s *Server) createSyncRecord(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
@@ -562,7 +558,7 @@ func (s *Server) adminExpandFolder(w http.ResponseWriter, r *http.Request, accou
 	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "已请求客户端上报下一级目录，客户端下一轮同步后会出现在列表中"}, dashboardOptions{View: "spaces"})
 }
 
-func (s *Server) adminSetFolderPath(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
+func (s *Server) adminSetClientStorageRoot(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
 	if err := r.ParseForm(); err != nil {
 		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "spaces"})
 		return
@@ -572,14 +568,14 @@ func (s *Server) adminSetFolderPath(w http.ResponseWriter, r *http.Request, acco
 		accountID = account.ID
 	}
 	if accountID != account.ID && !account.IsAdmin {
-		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: "没有权限修改其他账号的客户端路径"}, dashboardOptions{View: "spaces"})
+		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: "没有权限修改其他账号的客户端保存目录"}, dashboardOptions{View: "spaces"})
 		return
 	}
-	if err := s.store.SetFolderLocalPath(accountID, r.Form.Get("folder_id"), r.Form.Get("local_path")); err != nil {
+	if err := s.store.SetClientStorageRoot(accountID, r.Form.Get("device_id"), r.Form.Get("storage_root")); err != nil {
 		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "spaces"})
 		return
 	}
-	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "客户端同步放置目录已更新，客户端下一轮状态刷新后生效"}, dashboardOptions{View: "spaces"})
+	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "客户端全局保存目录已更新，客户端下一轮状态刷新后生效"}, dashboardOptions{View: "spaces"})
 }
 
 func (s *Server) adminUpdateSyncSettings(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
@@ -718,6 +714,7 @@ func (s *Server) renderDashboard(w http.ResponseWriter, account syncmodel.Accoun
 		Account  syncmodel.Account
 		Spaces   []syncmodel.SpaceSummary
 		Folders  []folderView
+		Devices  []syncmodel.ClientDevice
 		Records  []syncmodel.SyncRecord
 		Settings syncmodel.SyncSettings
 	}
@@ -809,6 +806,7 @@ func (s *Server) renderDashboard(w http.ResponseWriter, account syncmodel.Accoun
 			Account:  item,
 			Spaces:   spaces,
 			Folders:  folderViews,
+			Devices:  s.store.ListClientDevices(item.ID),
 			Records:  s.store.ListSyncRecords(item.ID, 120),
 			Settings: syncmodel.NormalizeSyncSettings(item.SyncSettings),
 		})
@@ -1006,13 +1004,14 @@ const dashboardHTML = `<!doctype html>
     .nav{padding:20px 14px;flex:1}.nav p{font-size:12px;text-transform:uppercase;letter-spacing:.6px;font-family:figmaMono,"SF Mono",Menlo,monospace;margin:10px 12px 14px}.nav button{width:100%;height:44px;display:flex;align-items:center;gap:10px;padding:0 14px;border-radius:9999px;color:var(--ink);font-size:16px;margin:6px 0;background:transparent;border:0;font-weight:480;cursor:pointer;text-align:left}.nav button.active{background:var(--ink);color:var(--canvas)}.nav button:not(.active):hover{background:var(--soft)}.logout{padding:18px;border-top:1px solid var(--hair)}.logout button{width:100%;height:42px;border:1px solid var(--ink);border-radius:9999px;background:var(--canvas);color:var(--ink);font-weight:480;cursor:pointer}
     .main{margin-left:268px;min-width:0;flex:1}.top{height:72px;background:var(--canvas);border-bottom:1px solid var(--hair);display:flex;align-items:center;justify-content:space-between;padding:0 32px;position:sticky;top:0;z-index:5}.top-left{display:flex;align-items:center;gap:14px;min-width:0}.menu-toggle{display:none;width:42px;height:42px;padding:0;align-items:center;justify-content:center}.search{height:42px;width:min(420px,48vw);display:flex;align-items:center;gap:8px;background:var(--soft);border:1px solid var(--hair);border-radius:9999px;padding:0 16px}.search input{border:0;background:transparent;outline:none;width:100%;font-size:16px}.user{display:flex;align-items:center;gap:12px}.avatar{width:38px;height:38px;border-radius:9999px;background:var(--lilac);color:var(--ink);display:flex;align-items:center;justify-content:center;font-weight:700;border:1px solid var(--ink)}.content{padding:32px;max-width:1320px;margin:0 auto}.hero{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:24px;padding:48px;border-radius:24px;background:var(--lime)}.hero h1{font-size:64px;line-height:1;margin:0 0 14px;letter-spacing:0;font-weight:340}.muted{color:var(--ink);font-size:16px;line-height:1.45;font-weight:330}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.stat{border:1px solid var(--ink);border-radius:24px;padding:22px;background:var(--canvas)}.stat:nth-child(2){background:var(--cream)}.stat:nth-child(3){background:var(--mint)}.stat:nth-child(4){background:var(--pink)}.stat .label{font-size:12px;text-transform:uppercase;letter-spacing:.6px;font-family:figmaMono,"SF Mono",Menlo,monospace;margin-bottom:10px}.stat strong{font-size:36px;font-weight:540}.stat .hint{font-size:13px;margin-top:10px}
     .two{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.8fr);gap:18px;margin-top:18px}.panel{background:var(--canvas);border:1px solid var(--hair);border-radius:24px;padding:24px;margin-bottom:18px}.panel:nth-child(2n){background:var(--cream)}.panel h2{font-size:26px;margin:0 0 14px;font-weight:540}.panel h3{font-size:20px;margin:20px 0 10px}.flash{border-radius:8px;padding:14px 16px;margin-bottom:18px;word-break:break-all;font-size:15px;border:1px solid var(--ink)}.flash.success{background:var(--mint)}.flash.error{background:var(--pink)}
-    .folder-list{border:1px solid var(--ink);border-radius:24px;background:var(--canvas);overflow:auto;max-height:560px}.folder-node{position:relative;background:var(--canvas);border-bottom:1px solid var(--hair)}.folder-node:last-child{border-bottom:0}.folder-node.selected{background:var(--lime)}.folder-node.disabled{opacity:.58}.folder-node.loading{background:var(--cream)}.folder-node.collapsed-child{display:none}.folder-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(430px,auto);gap:14px;align-items:center;min-height:52px;padding:8px 12px;transition:background .16s}.folder-row:hover{background:var(--soft)}.folder-left{display:flex;align-items:center;gap:10px;min-width:0}.tree-indent{width:var(--indent);flex:0 0 var(--indent);height:1px}.branch{width:18px;height:28px;border-left:1px solid var(--ink);border-bottom:1px solid var(--ink);border-bottom-left-radius:8px;flex:0 0 18px}.folder-node.root .branch{border-color:transparent;width:0;flex-basis:0}.folder-icon{width:28px;height:28px;border-radius:9999px;background:var(--canvas);border:1px solid var(--ink);display:flex;align-items:center;justify-content:center;font-size:12px;flex:0 0 28px}.folder-copy{min-width:0}.folder-title{display:flex;align-items:center;gap:8px;min-width:0}.folder-title strong{font-size:16px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.folder-path{font-size:12px;line-height:1.35;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:min(620px,46vw)}.folder-local{font-size:12px;line-height:1.35;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:min(620px,46vw)}.folder-meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.folder-actions{display:grid;grid-template-columns:auto minmax(150px,1fr) auto auto;gap:6px;align-items:center;justify-content:flex-end}.folder-actions form,.expand-form{margin:0}.mini{font-size:12px;line-height:1.35}.warn{background:var(--coral);color:var(--ink)}.loading-row{display:flex;align-items:center;gap:10px;padding:0 12px 10px;color:var(--ink);font-size:13px}.spinner{width:14px;height:14px;border:2px solid var(--ink);border-right-color:transparent;border-radius:9999px;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.empty-tree{padding:18px}
+    .folder-list{border:1px solid var(--ink);border-radius:24px;background:var(--canvas);overflow:auto;max-height:560px}.folder-node{position:relative;background:var(--canvas);border-bottom:1px solid var(--hair)}.folder-node:last-child{border-bottom:0}.folder-node.selected{background:var(--lime)}.folder-node.disabled{opacity:.58}.folder-node.loading{background:var(--cream)}.folder-node.collapsed-child{display:none}.folder-row{display:grid;grid-template-columns:minmax(0,1fr) max-content;gap:12px;align-items:center;min-height:56px;padding:9px 12px;transition:background .16s}.folder-row:hover{background:var(--soft)}.folder-left{display:flex;align-items:center;gap:10px;min-width:0}.tree-indent{width:var(--indent);flex:0 0 var(--indent);height:1px}.branch{width:18px;height:28px;border-left:1px solid var(--ink);border-bottom:1px solid var(--ink);border-bottom-left-radius:8px;flex:0 0 18px}.folder-node.root .branch{border-color:transparent;width:0;flex-basis:0}.folder-icon{width:28px;height:28px;border-radius:9999px;background:var(--canvas);border:1px solid var(--ink);display:flex;align-items:center;justify-content:center;font-size:12px;flex:0 0 28px}.folder-copy{min-width:0}.folder-title{display:flex;align-items:center;gap:7px;min-width:0;flex-wrap:wrap}.folder-title strong{font-size:16px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px}.folder-path{font-size:12px;line-height:1.35;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:min(680px,50vw)}.folder-meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.folder-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;white-space:nowrap}.folder-actions form{margin:0}.folder-actions button,.folder-actions select{height:34px;padding:7px 12px;font-size:13px}.folder-actions select{width:130px}.select-form{display:flex;align-items:center;gap:6px}.mini{font-size:12px;line-height:1.35}.warn{background:var(--coral);color:var(--ink)}.loading-row{display:flex;align-items:center;gap:10px;padding:0 12px 10px;color:var(--ink);font-size:13px}.spinner{width:14px;height:14px;border:2px solid var(--ink);border-right-color:transparent;border-radius:9999px;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.empty-tree{padding:18px}
+    .device-list{display:grid;gap:10px}.device-card{border:1px solid var(--ink);border-radius:8px;background:var(--canvas);padding:14px}.device-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.device-title{min-width:0}.device-title strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.device-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end}.device-form button{height:42px}.device-meta{font-size:12px;line-height:1.4;margin-top:6px;word-break:break-all}
     .record-list{display:grid;gap:8px}.record-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--hair);border-radius:8px;padding:12px;background:var(--canvas)}.record-main{min-width:0}.record-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.record-path{font-size:12px;word-break:break-all;margin-top:4px}.record-meta{font-size:12px;margin-top:5px}.record-side{text-align:right;font-size:12px;min-width:160px}
     table{width:100%;border-collapse:collapse;font-size:15px}th,td{border-bottom:1px solid var(--hair);text-align:left;padding:12px 8px;vertical-align:top}th{font-size:12px;text-transform:uppercase;letter-spacing:.6px;font-family:figmaMono,"SF Mono",Menlo,monospace}code,.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.cmd{background:var(--inverse);color:var(--inverse-ink);border-radius:8px;padding:14px;word-break:break-all}
     label{display:block;font-size:12px;font-weight:400;margin:12px 0 6px;font-family:figmaMono,"SF Mono",Menlo,monospace;text-transform:uppercase;letter-spacing:.6px}input,textarea,select{box-sizing:border-box;width:100%;border:1px solid var(--hair);border-radius:8px;padding:11px 12px;font-size:16px;background:var(--canvas);color:var(--ink)}input:focus,textarea:focus,select:focus{outline:none;border-color:var(--ink);box-shadow:0 0 0 3px var(--lime)}textarea{min-height:78px;resize:vertical}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.inline{display:inline}
     button{border:0;border-radius:9999px;background:var(--ink);color:var(--canvas);font-weight:480;font-size:15px;padding:10px 18px;cursor:pointer}.secondary{background:var(--canvas);color:var(--ink);border:1px solid var(--ink)}.danger{background:var(--magenta);color:var(--canvas)}.badge{display:inline-flex;align-items:center;min-height:24px;padding:0 9px;border-radius:9999px;font-size:12px;font-weight:480;background:var(--canvas);color:var(--ink);border:1px solid var(--ink)}.ok{background:var(--mint);color:var(--ink)}.off{background:var(--pink);color:var(--ink)}
     .view{display:none}.view.active{display:block}.overview-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.compact{max-width:760px}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.small-select{min-width:140px}.path{max-width:360px;word-break:break-all}
-    @media(max-width:980px){.side{width:min(300px,86vw);transform:translateX(-102%);transition:transform .22s ease}.shell.menu-open .side{transform:translateX(0)}.scrim{position:fixed;inset:0;background:rgba(0,0,0,.48);z-index:15}.shell.menu-open .scrim{display:block}.main{margin-left:0}.menu-toggle{display:inline-flex}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.two{grid-template-columns:1fr}.top{padding:0 16px}.content{padding:18px}.hero{flex-direction:column;padding:32px}.hero h1{font-size:48px}}@media(max-width:560px){.grid,.form-grid{grid-template-columns:1fr}.search{display:none}.folder-row{grid-template-columns:1fr}.folder-actions{justify-content:flex-start;padding-left:calc(var(--indent) + 56px)}.folder-path{max-width:100%}.hero h1{font-size:40px}.user .muted{display:none}}
+    @media(max-width:980px){.side{width:min(300px,86vw);transform:translateX(-102%);transition:transform .22s ease}.shell.menu-open .side{transform:translateX(0)}.scrim{position:fixed;inset:0;background:rgba(0,0,0,.48);z-index:15}.shell.menu-open .scrim{display:block}.main{margin-left:0}.menu-toggle{display:inline-flex}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.two{grid-template-columns:1fr}.top{padding:0 16px}.content{padding:18px}.hero{flex-direction:column;padding:32px}.hero h1{font-size:48px}.folder-path{max-width:58vw}}@media(max-width:560px){.grid,.form-grid,.device-form{grid-template-columns:1fr}.search{display:none}.folder-row{grid-template-columns:1fr}.folder-actions{justify-content:flex-start;padding-left:calc(var(--indent) + 56px);flex-wrap:wrap}.folder-path{max-width:100%}.hero h1{font-size:40px}.user .muted{display:none}}
   </style>
 </head>
 <body>
@@ -1060,9 +1059,9 @@ const dashboardHTML = `<!doctype html>
           </div>
           <section class="panel" style="margin-top:18px">
             <h2>客户端命令</h2>
-            <p class="muted">客户端启动后会先上报本机目录。网关选择目录前，客户端不会上传或下载文件。-space 只是建议分组，实际同步 Space 由这里选择。</p>
-            <div class="cmd">./xcloud client -server http://127.0.0.1:8080 -token &lt;账号token&gt; -space default</div>
-            <p class="muted">也可以加 -root /path/to/folder 只上报并同步单个目录。</p>
+            <p class="muted">客户端首次启动无需 token。打开本机客户端页面登录云端账号并开启同步后，客户端会上报根级目录，网关选择目录前不会上传或下载文件。</p>
+            <div class="cmd">./xcloud client -server http://127.0.0.1:8080</div>
+            <p class="muted">默认保存根目录是客户端进程启动目录下的 xcloud，可在“客户端保存目录”里按设备修改。</p>
           </section>
         </section>
 
@@ -1080,7 +1079,7 @@ const dashboardHTML = `<!doctype html>
               <div class="folder-list">
                 {{range .Folders}}
                 {{$currentSpace := .Folder.SpaceID}}
-                <div class="folder-node {{if not .HasParent}}root{{end}} {{if eq .Folder.Status "selected"}}selected{{end}} {{if eq .Folder.Status "disabled"}}disabled{{end}} {{if .HasLoading}}loading{{end}}" data-folder-id="{{.Folder.ID}}" data-parent-path="{{.Folder.ParentPath}}" data-root-path="{{.Folder.RootPath}}" data-depth="{{.Folder.Depth}}" style="--indent:{{.Indent}}px">
+                <div class="folder-node {{if not .HasParent}}root{{end}} {{if eq .Folder.Status "selected"}}selected{{end}} {{if eq .Folder.Status "disabled"}}disabled{{end}} {{if .HasLoading}}loading{{end}}" data-folder-id="{{.Folder.ID}}" data-device-id="{{.Folder.DeviceID}}" data-parent-path="{{.Folder.ParentPath}}" data-root-path="{{.Folder.RootPath}}" data-depth="{{.Folder.Depth}}" style="--indent:{{.Indent}}px">
                   <div class="folder-row">
                     <div class="folder-left">
                       <span class="tree-indent"></span>
@@ -1089,7 +1088,6 @@ const dashboardHTML = `<!doctype html>
                       <div class="folder-copy">
                         <div class="folder-title"><strong>{{.Base}}</strong>{{if eq .Folder.Status "selected"}}<span class="badge ok">已选择</span>{{else if eq .Folder.Status "disabled"}}<span class="badge off">已停用</span>{{else}}<span class="badge">待选择</span>{{end}}{{if .HasLoading}}<span class="badge warn">加载中</span>{{else if .Folder.ChildrenReported}}<span class="badge ok">已展开</span>{{end}}</div>
                         <div class="folder-path"><code>{{.Folder.RootPath}}</code></div>
-                        <div class="folder-local">放置目录 <code>{{if .Folder.LocalPath}}{{.Folder.LocalPath}}{{else}}{{.Folder.RootPath}}{{end}}</code></div>
                         <div class="mini">设备 {{.Folder.DeviceID}} · 层级 {{.Folder.Depth}}{{if .Folder.SpaceID}} · Space {{.Folder.SpaceID}}{{else}} · 未分配 Space{{end}}{{if .Folder.ParentPath}} · 上级 {{.Folder.ParentPath}}{{end}}</div>
                       </div>
                     </div>
@@ -1103,13 +1101,7 @@ const dashboardHTML = `<!doctype html>
                         <button class="secondary" type="submit">展开</button>
                       </form>
                       {{end}}
-                      <form class="inline" method="post" action="/admin/folders/set-path">
-                        <input type="hidden" name="account_id" value="{{.Folder.AccountID}}">
-                        <input type="hidden" name="folder_id" value="{{.Folder.ID}}">
-                        <input name="local_path" value="{{if .Folder.LocalPath}}{{.Folder.LocalPath}}{{else}}{{.Folder.RootPath}}{{end}}" title="客户端本地同步放置目录" required>
-                        <button class="secondary" type="submit">保存路径</button>
-                      </form>
-                      <form class="inline actions" method="post" action="/admin/folders/select">
+                      <form class="inline select-form" method="post" action="/admin/folders/select">
                         <input type="hidden" name="account_id" value="{{.Folder.AccountID}}">
                         <input type="hidden" name="folder_id" value="{{.Folder.ID}}">
                         <select class="small-select" name="space_id">
@@ -1134,6 +1126,34 @@ const dashboardHTML = `<!doctype html>
             {{end}}
             </div>
             <aside>
+            {{range .Groups}}
+            <section class="panel">
+              <h2>{{.Account.Username}} 的客户端保存目录</h2>
+              <p class="muted">这里配置的是设备级全局保存根目录，不是单个同步目录。每个已选择同步的目录会在该根目录下按 Space 和目录哈希生成独立子目录。</p>
+              <div class="device-list">
+                {{range .Devices}}
+                <div class="device-card">
+                  <div class="device-head">
+                    <div class="device-title"><strong>{{.DeviceID}}</strong><span class="mini">{{if .Hostname}}{{.Hostname}}{{else}}未上报主机名{{end}}</span></div>
+                    <span class="badge">{{if .LastSeenAt}}{{formatTime .LastSeenAt}}{{else}}未心跳{{end}}</span>
+                  </div>
+                  <form class="device-form" method="post" action="/admin/clients/storage-root">
+                    <input type="hidden" name="account_id" value="{{.AccountID}}">
+                    <input type="hidden" name="device_id" value="{{.DeviceID}}">
+                    <div>
+                      <label>保存根目录</label>
+                      <input name="storage_root" value="{{.StorageRoot}}" placeholder="/absolute/path/to/xcloud" required>
+                    </div>
+                    <button class="secondary" type="submit">保存</button>
+                  </form>
+                  <div class="device-meta">客户端会自动创建该目录；路径必须是客户端所在机器上的绝对路径。</div>
+                </div>
+                {{else}}
+                <div class="empty-tree"><span class="muted">暂无已登录客户端。客户端登录云端账号后会出现在这里。</span></div>
+                {{end}}
+              </div>
+            </section>
+            {{end}}
             <section class="panel">
               <h2>创建 Space</h2>
               <form method="post" action="/admin/spaces/create">
@@ -1337,7 +1357,10 @@ const dashboardHTML = `<!doctype html>
       buttons.forEach(function(button){ button.addEventListener("click", function(){ show(button.getAttribute("data-view-target")); }); });
       var nodes = Array.prototype.slice.call(document.querySelectorAll(".folder-node"));
       function childNodes(parent){
-        return nodes.filter(function(node){ return node.getAttribute("data-parent-path") === parent.getAttribute("data-root-path"); });
+        return nodes.filter(function(node){
+          return node.getAttribute("data-device-id") === parent.getAttribute("data-device-id") &&
+            node.getAttribute("data-parent-path") === parent.getAttribute("data-root-path");
+        });
       }
       function setChildren(parent, hidden){
         childNodes(parent).forEach(function(child){

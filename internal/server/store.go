@@ -43,6 +43,7 @@ func NewStore(root string) (*Store, error) {
 		state: syncmodel.ServerState{
 			Accounts:      map[string]*syncmodel.Account{},
 			ClientTokens:  map[string]*syncmodel.ClientToken{},
+			ClientDevices: map[string]*syncmodel.ClientDevice{},
 			Spaces:        map[string]*syncmodel.SyncSpace{},
 			ClientFolders: map[string]*syncmodel.ClientFolder{},
 			Files:         map[string]*syncmodel.FileEntry{},
@@ -81,6 +82,9 @@ func (s *Store) load() error {
 	}
 	if s.state.ClientTokens == nil {
 		s.state.ClientTokens = map[string]*syncmodel.ClientToken{}
+	}
+	if s.state.ClientDevices == nil {
+		s.state.ClientDevices = map[string]*syncmodel.ClientDevice{}
 	}
 	if s.state.Spaces == nil {
 		s.state.Spaces = map[string]*syncmodel.SyncSpace{}
@@ -139,6 +143,9 @@ func (s *Store) ensureBootstrap() error {
 		return s.saveLocked()
 	}
 	changed := s.normalizeAccountsLocked()
+	if s.normalizeDevicesLocked() {
+		changed = true
+	}
 	if s.normalizeFoldersLocked() {
 		changed = true
 	}
@@ -206,8 +213,79 @@ func (s *Store) normalizeFoldersLocked() bool {
 			folder.Depth = 0
 			changed = true
 		}
-		if folder.LocalPath == "" {
-			folder.LocalPath = folder.RootPath
+	}
+	return changed
+}
+
+func (s *Store) normalizeDevicesLocked() bool {
+	if s.state.ClientDevices == nil {
+		s.state.ClientDevices = map[string]*syncmodel.ClientDevice{}
+	}
+	changed := false
+	for _, token := range s.state.ClientTokens {
+		if token.AccountID == "" || token.DeviceID == "" {
+			continue
+		}
+		key := deviceKey(token.AccountID, token.DeviceID)
+		device := s.state.ClientDevices[key]
+		if device == nil {
+			createdAt := token.CreatedAt
+			if createdAt == 0 {
+				createdAt = time.Now().Unix()
+			}
+			device = &syncmodel.ClientDevice{
+				AccountID:  token.AccountID,
+				DeviceID:   token.DeviceID,
+				Hostname:   token.Hostname,
+				CreatedAt:  createdAt,
+				UpdatedAt:  createdAt,
+				LastSeenAt: token.LastUsedAt,
+			}
+			s.state.ClientDevices[key] = device
+			changed = true
+			continue
+		}
+		if device.Hostname == "" && token.Hostname != "" {
+			device.Hostname = token.Hostname
+			changed = true
+		}
+		if token.LastUsedAt > device.LastSeenAt {
+			device.LastSeenAt = token.LastUsedAt
+			changed = true
+		}
+	}
+	for _, folder := range s.state.ClientFolders {
+		if folder.AccountID == "" || folder.DeviceID == "" {
+			continue
+		}
+		key := deviceKey(folder.AccountID, folder.DeviceID)
+		device := s.state.ClientDevices[key]
+		if device == nil {
+			createdAt := folder.CreatedAt
+			if createdAt == 0 {
+				createdAt = folder.UpdatedAt
+			}
+			if createdAt == 0 {
+				createdAt = time.Now().Unix()
+			}
+			device = &syncmodel.ClientDevice{
+				AccountID:  folder.AccountID,
+				DeviceID:   folder.DeviceID,
+				Hostname:   folder.Hostname,
+				CreatedAt:  createdAt,
+				UpdatedAt:  createdAt,
+				LastSeenAt: folder.LastSeenAt,
+			}
+			s.state.ClientDevices[key] = device
+			changed = true
+			continue
+		}
+		if device.Hostname == "" && folder.Hostname != "" {
+			device.Hostname = folder.Hostname
+			changed = true
+		}
+		if folder.LastSeenAt > device.LastSeenAt {
+			device.LastSeenAt = folder.LastSeenAt
 			changed = true
 		}
 	}
@@ -324,10 +402,15 @@ func (s *Store) AccountForSyncToken(token string) (*syncmodel.Account, bool) {
 	return s.AuthenticateSyncToken(token)
 }
 
-func (s *Store) IssueClientToken(identifier, password, deviceID, hostname string) (syncmodel.Account, string, error) {
+func (s *Store) IssueClientToken(identifier, password, deviceID, hostname, storageRoot string) (syncmodel.Account, string, string, error) {
 	identifier = strings.ToLower(strings.TrimSpace(identifier))
 	deviceID = strings.TrimSpace(deviceID)
 	hostname = strings.TrimSpace(hostname)
+	storageRoot = strings.TrimSpace(storageRoot)
+	if storageRoot != "" && !isClientAbsolutePath(storageRoot) {
+		return syncmodel.Account{}, "", "", errors.New("storage root must be absolute")
+	}
+	storageRoot = cleanClientPath(storageRoot)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var account *syncmodel.Account
@@ -346,10 +429,13 @@ func (s *Store) IssueClientToken(identifier, password, deviceID, hostname string
 		}
 	}
 	if account == nil {
-		return syncmodel.Account{}, "", errors.New("invalid account or password")
+		return syncmodel.Account{}, "", "", errors.New("invalid account or password")
 	}
 	if s.state.ClientTokens == nil {
 		s.state.ClientTokens = map[string]*syncmodel.ClientToken{}
+	}
+	if s.state.ClientDevices == nil {
+		s.state.ClientDevices = map[string]*syncmodel.ClientDevice{}
 	}
 	now := time.Now().Unix()
 	token := fileutil.NewID() + fileutil.NewID()
@@ -362,13 +448,23 @@ func (s *Store) IssueClientToken(identifier, password, deviceID, hostname string
 		CreatedAt: now,
 	}
 	s.state.ClientTokens[clientToken.ID] = clientToken
+	effectiveStorageRoot := storageRoot
+	if deviceID != "" {
+		device := s.ensureClientDeviceLocked(account.ID, deviceID, hostname, now)
+		if effectiveStorageRoot != "" && device.StorageRoot == "" {
+			device.StorageRoot = effectiveStorageRoot
+		}
+		if device.StorageRoot != "" {
+			effectiveStorageRoot = device.StorageRoot
+		}
+	}
 	if err := s.saveLocked(); err != nil {
-		return syncmodel.Account{}, "", err
+		return syncmodel.Account{}, "", "", err
 	}
 	copy := *account
 	copy.PasswordHash = ""
 	copy.SyncTokenHash = ""
-	return copy, token, nil
+	return copy, token, effectiveStorageRoot, nil
 }
 
 func (s *Store) SetAccountSyncEnabled(accountID string, enabled bool) error {
@@ -604,12 +700,17 @@ func (s *Store) ReportFolder(accountID string, req syncmodel.FolderReportRequest
 	rootPath := strings.TrimSpace(req.RootPath)
 	parentPath := strings.TrimSpace(req.ParentPath)
 	hostname := strings.TrimSpace(req.Hostname)
+	storageRoot := strings.TrimSpace(req.StorageRoot)
 	if deviceID == "" {
 		return syncmodel.FolderReportResponse{}, errors.New("device_id is required")
 	}
 	if rootPath == "" {
 		return syncmodel.FolderReportResponse{}, errors.New("root_path is required")
 	}
+	if storageRoot != "" && !isClientAbsolutePath(storageRoot) {
+		return syncmodel.FolderReportResponse{}, errors.New("storage_root must be absolute")
+	}
+	storageRoot = cleanClientPath(storageRoot)
 	suggestedSpaceID := strings.TrimSpace(req.SuggestedSpaceID)
 	if suggestedSpaceID == "" {
 		suggestedSpaceID = "default"
@@ -623,6 +724,14 @@ func (s *Store) ReportFolder(accountID string, req syncmodel.FolderReportRequest
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.state.ClientDevices == nil {
+		s.state.ClientDevices = map[string]*syncmodel.ClientDevice{}
+	}
+	device := s.ensureClientDeviceLocked(accountID, deviceID, hostname, now)
+	if storageRoot != "" && device.StorageRoot == "" {
+		device.StorageRoot = storageRoot
+		device.UpdatedAt = now
+	}
 	folder := s.state.ClientFolders[key]
 	if folder == nil {
 		folder = &syncmodel.ClientFolder{
@@ -631,7 +740,6 @@ func (s *Store) ReportFolder(accountID string, req syncmodel.FolderReportRequest
 			DeviceID:         deviceID,
 			Hostname:         hostname,
 			RootPath:         rootPath,
-			LocalPath:        rootPath,
 			ParentPath:       parentPath,
 			Depth:            depth,
 			SuggestedSpaceID: suggestedSpaceID,
@@ -686,12 +794,34 @@ func (s *Store) ListFolders(accountID string) []syncmodel.ClientFolder {
 	return out
 }
 
+func (s *Store) ListClientDevices(accountID string) []syncmodel.ClientDevice {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []syncmodel.ClientDevice{}
+	for _, device := range s.state.ClientDevices {
+		if device.AccountID != accountID {
+			continue
+		}
+		out = append(out, *device)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].LastSeenAt != out[j].LastSeenAt {
+			return out[i].LastSeenAt > out[j].LastSeenAt
+		}
+		return out[i].DeviceID < out[j].DeviceID
+	})
+	return out
+}
+
 func (s *Store) FolderStatus(accountID, deviceID string) syncmodel.FolderStatusResponse {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := syncmodel.FolderStatusResponse{Settings: syncmodel.DefaultSyncSettings()}
 	if account := s.state.Accounts[accountID]; account != nil {
 		resp.Settings = syncmodel.NormalizeSyncSettings(account.SyncSettings)
+	}
+	if device := s.state.ClientDevices[deviceKey(accountID, deviceID)]; device != nil {
+		resp.StorageRoot = device.StorageRoot
 	}
 	for _, folder := range s.state.ClientFolders {
 		if folder.AccountID != accountID {
@@ -733,6 +863,17 @@ func (s *Store) ClientStatus(accountID, deviceID string) syncmodel.ClientStatusR
 	resp.Account = accountProfile(*account)
 	resp.SyncEnabled = account.SyncEnabled
 	resp.Settings = syncmodel.NormalizeSyncSettings(account.SyncSettings)
+	if deviceID != "" {
+		now := time.Now().Unix()
+		if device := s.state.ClientDevices[deviceKey(accountID, deviceID)]; device != nil {
+			device.LastSeenAt = now
+			device.UpdatedAt = now
+			resp.StorageRoot = device.StorageRoot
+			_ = s.saveLocked()
+		}
+	} else if device := s.state.ClientDevices[deviceKey(accountID, deviceID)]; device != nil {
+		resp.StorageRoot = device.StorageRoot
+	}
 	for _, folder := range s.state.ClientFolders {
 		if folder.AccountID != accountID {
 			continue
@@ -825,29 +966,34 @@ func (s *Store) SelectFolder(accountID, folderID, spaceID string) error {
 	return errors.New("client folder not found")
 }
 
-func (s *Store) SetFolderLocalPath(accountID, folderID, localPath string) error {
-	if folderID == "" {
-		return errors.New("folder_id is required")
+func (s *Store) SetClientStorageRoot(accountID, deviceID, storageRoot string) error {
+	deviceID = strings.TrimSpace(deviceID)
+	storageRoot = strings.TrimSpace(storageRoot)
+	if deviceID == "" {
+		return errors.New("device_id is required")
 	}
-	localPath = strings.TrimSpace(localPath)
-	if localPath == "" {
-		return errors.New("local path is required")
+	if storageRoot == "" {
+		return errors.New("storage root is required")
 	}
-	if !isClientAbsolutePath(localPath) {
-		return errors.New("local path must be absolute")
+	if !isClientAbsolutePath(storageRoot) {
+		return errors.New("storage root must be absolute")
 	}
-	cleanPath := cleanClientPath(localPath)
+	cleanPath := cleanClientPath(storageRoot)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, folder := range s.state.ClientFolders {
-		if folder.AccountID != accountID || folder.ID != folderID {
-			continue
-		}
-		folder.LocalPath = cleanPath
-		folder.UpdatedAt = time.Now().Unix()
-		return s.saveLocked()
+	device := s.state.ClientDevices[deviceKey(accountID, deviceID)]
+	if device == nil {
+		return errors.New("client device not found")
 	}
-	return errors.New("client folder not found")
+	now := time.Now().Unix()
+	device.StorageRoot = cleanPath
+	device.UpdatedAt = now
+	for _, token := range s.state.ClientTokens {
+		if token.AccountID == accountID && token.DeviceID == deviceID {
+			token.Hostname = firstNonEmpty(token.Hostname, device.Hostname)
+		}
+	}
+	return s.saveLocked()
 }
 
 func isClientAbsolutePath(path string) bool {
@@ -865,12 +1011,20 @@ func isClientAbsolutePath(path string) bool {
 }
 
 func cleanClientPath(path string) string {
+	path = strings.TrimSpace(path)
 	if filepath.IsAbs(path) {
 		return filepath.Clean(path)
 	}
-	path = strings.ReplaceAll(path, "/", `\`)
-	for strings.Contains(path, `\\\`) {
-		path = strings.ReplaceAll(path, `\\\`, `\\`)
+	path = strings.ReplaceAll(path, "/", "\\")
+	if strings.HasPrefix(path, "\\\\") {
+		rest := strings.TrimLeft(path[2:], "\\")
+		for strings.Contains(rest, "\\\\") {
+			rest = strings.ReplaceAll(rest, "\\\\", "\\")
+		}
+		return "\\\\" + rest
+	}
+	for strings.Contains(path, "\\\\") {
+		path = strings.ReplaceAll(path, "\\\\", "\\")
 	}
 	return path
 }
@@ -1294,6 +1448,29 @@ func (s *Store) trimSyncRecordsLocked(accountID string) {
 	}
 }
 
+func (s *Store) ensureClientDeviceLocked(accountID, deviceID, hostname string, now int64) *syncmodel.ClientDevice {
+	key := deviceKey(accountID, deviceID)
+	device := s.state.ClientDevices[key]
+	if device == nil {
+		device = &syncmodel.ClientDevice{
+			AccountID:  accountID,
+			DeviceID:   deviceID,
+			Hostname:   hostname,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+			LastSeenAt: now,
+		}
+		s.state.ClientDevices[key] = device
+		return device
+	}
+	if hostname != "" {
+		device.Hostname = hostname
+	}
+	device.LastSeenAt = now
+	device.UpdatedAt = now
+	return device
+}
+
 func (s *Store) verifyManifest(accountID string, manifest syncmodel.Manifest) error {
 	if len(manifest.Chunks) == 0 {
 		if manifest.Size != 0 {
@@ -1411,6 +1588,10 @@ func accountChunkKey(accountID, hash string) string {
 	return accountID + "\x00" + hash
 }
 
+func deviceKey(accountID, deviceID string) string {
+	return accountID + "\x00" + strings.TrimSpace(deviceID)
+}
+
 func spaceKey(accountID, spaceID string) string {
 	return accountID + "\x00" + spaceID
 }
@@ -1443,4 +1624,13 @@ func isHash(v string) bool {
 		return false
 	}
 	return true
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }

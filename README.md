@@ -59,9 +59,10 @@ when any logged-in client enables it, every other client already logged in to
 the same account detects the enabled state and starts syncing automatically. The
 client stores a device credential in `~/.xcloud/client-config.json`, reports
 local folders to the cloud gateway, and waits for folder selection in `/admin`.
-When `-root` is omitted, the default reported and synced folder is `xcloud`
-under the client's process working directory. The management console can later
-change the local placement path for a reported client folder.
+When `-root` is omitted, the device storage root defaults to `xcloud` under the
+client's process working directory. The management console can later change this
+storage root for the whole client device. It is not configured per reported
+folder.
 
 For explicit single-folder deployments, pass `-root` before logging in from the
 local client console:
@@ -104,10 +105,13 @@ For a single sync cycle:
 one selected by the gateway in the management console.
 
 `-root` is optional. Without it, the client uses `<process working directory>/xcloud`
-as the default sync folder, creates it if needed, and reports it to the gateway.
-In the console, use `展开下一级` to ask the client to report the next level.
-Already reported folders are cached locally and are not reported repeatedly.
-With `-root`, the client runs in compatibility mode for one explicit folder.
+as the default device storage root, creates it if needed, and reports it to the
+gateway. The management console can change this storage root per client device.
+Selected folders are stored under that root by Space and source-folder hash, so
+the storage root is global to the device, not a per-folder setting. In the
+console, use `展开下一级` to ask the client to report the next level. Already
+reported folders are cached locally and are not reported repeatedly. With
+`-root`, the client runs in compatibility mode for one explicit folder.
 
 The server stores account-level sync trigger settings. By default clients use
 filesystem watching for near real-time sync plus a periodic scan fallback. The

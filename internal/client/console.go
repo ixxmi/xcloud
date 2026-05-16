@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -83,6 +84,9 @@ func NewConsole(cfg ConsoleConfig) (*Console, error) {
 	if local.DeviceID == "" {
 		local.DeviceID = cfg.DeviceID
 	}
+	if local.StorageRoot == "" {
+		local.StorageRoot = defaultStorageRoot(cfg.Root)
+	}
 	local.SyncSettings = syncmodel.NormalizeSyncSettings(local.SyncSettings)
 	local.DeleteRemote = local.DeleteRemote || cfg.DeleteRemote
 	return &Console{cfg: cfg, log: cfg.Log, local: local}, nil
@@ -147,10 +151,11 @@ func (c *Console) handleLogin(w http.ResponseWriter, r *http.Request) {
 	host, _ := os.Hostname()
 	api := NewAPI(serverURL, "", c.cfg.SpaceID, c.cfg.DeviceID, "")
 	resp, err := api.ClientLogin(syncmodel.ClientLoginRequest{
-		Identifier: r.Form.Get("identifier"),
-		Password:   r.Form.Get("password"),
-		DeviceID:   c.cfg.DeviceID,
-		Hostname:   host,
+		Identifier:  r.Form.Get("identifier"),
+		Password:    r.Form.Get("password"),
+		DeviceID:    c.cfg.DeviceID,
+		Hostname:    host,
+		StorageRoot: c.local.StorageRoot,
 	})
 	if err != nil {
 		c.renderWithMessage(w, "error", "云端账号登录失败："+err.Error())
@@ -159,6 +164,14 @@ func (c *Console) handleLogin(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	c.local.ServerURL = serverURL
 	c.local.Token = resp.Token
+	if resp.StorageRoot != "" {
+		c.local.StorageRoot = resp.StorageRoot
+	}
+	if err := os.MkdirAll(c.local.StorageRoot, 0o755); err != nil {
+		c.mu.Unlock()
+		c.renderWithMessage(w, "error", "创建本机保存目录失败："+err.Error())
+		return
+	}
 	c.local.SpaceID = resp.SpaceID
 	c.local.DeviceID = c.cfg.DeviceID
 	c.local.Username = resp.Account.Username
@@ -194,6 +207,16 @@ func (c *Console) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	c.local.SyncEnabled = status.SyncEnabled
 	c.local.SyncSettings = syncmodel.NormalizeSyncSettings(status.Settings)
+	if status.StorageRoot != "" {
+		c.local.StorageRoot = status.StorageRoot
+	}
+	if c.local.StorageRoot != "" {
+		if err := os.MkdirAll(c.local.StorageRoot, 0o755); err != nil {
+			c.mu.Unlock()
+			c.renderWithMessage(w, "error", "创建本机保存目录失败："+err.Error())
+			return
+		}
+	}
 	if err := SaveLocalConfig(c.cfg.ConfigPath, c.local); err != nil {
 		c.mu.Unlock()
 		c.renderWithMessage(w, "error", err.Error())
@@ -298,6 +321,16 @@ func (c *Console) refreshCloudSync(ctx context.Context) {
 	c.mu.Lock()
 	c.local.SyncEnabled = status.SyncEnabled
 	c.local.SyncSettings = syncmodel.NormalizeSyncSettings(status.Settings)
+	if status.StorageRoot != "" {
+		c.local.StorageRoot = status.StorageRoot
+	}
+	if c.local.StorageRoot != "" {
+		if err := os.MkdirAll(c.local.StorageRoot, 0o755); err != nil {
+			c.lastError = "创建本机保存目录失败：" + err.Error()
+			c.mu.Unlock()
+			return
+		}
+	}
 	c.local.SpaceID = status.SpaceID
 	c.local.Username = status.Account.Username
 	c.local.DisplayName = status.Account.DisplayName
@@ -328,6 +361,7 @@ func (c *Console) startSyncLocked() {
 	cfg := Config{
 		ServerURL:    c.local.ServerURL,
 		Token:        c.local.Token,
+		StorageRoot:  c.local.StorageRoot,
 		SpaceID:      c.local.SpaceID,
 		DeviceID:     c.local.DeviceID,
 		StatePath:    c.cfg.StatePath,
@@ -404,6 +438,7 @@ func (c *Console) viewDataLocked(message string) clientConsoleData {
 		SpaceID:      c.local.SpaceID,
 		ConfigPath:   c.cfg.ConfigPath,
 		Root:         c.cfg.Root,
+		StorageRoot:  c.local.StorageRoot,
 		LastStarted:  c.lastStarted,
 		LastError:    c.lastError,
 		Message:      message,
@@ -423,11 +458,26 @@ type clientConsoleData struct {
 	SpaceID      string
 	ConfigPath   string
 	Root         string
+	StorageRoot  string
 	LastStarted  string
 	LastError    string
 	Message      string
 	MessageKind  string
 	DeleteRemote bool
+}
+
+func defaultStorageRoot(root string) string {
+	if strings.TrimSpace(root) != "" {
+		if abs, err := filepath.Abs(root); err == nil {
+			return abs
+		}
+		return root
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "xcloud"
+	}
+	return filepath.Join(cwd, "xcloud")
 }
 
 func renderClientConsole(w http.ResponseWriter, data clientConsoleData) {
@@ -479,6 +529,7 @@ const clientConsoleHTML = `<!doctype html>
             <div class="row"><span>云端</span><span>{{.ServerURL}}</span></div>
             <div class="row"><span>设备</span><span>{{.DeviceID}}</span></div>
             <div class="row"><span>Space</span><span>{{.SpaceID}}</span></div>
+            <div class="row"><span>保存根目录</span><span>{{.StorageRoot}}</span></div>
             <div class="row"><span>模式</span><span>{{if .Root}}指定目录：{{.Root}}{{else}}目录发现{{end}}</span></div>
             <div class="row"><span>配置</span><span>{{.ConfigPath}}</span></div>
             {{if .LastStarted}}<div class="row"><span>启动时间</span><span>{{.LastStarted}}</span></div>{{end}}

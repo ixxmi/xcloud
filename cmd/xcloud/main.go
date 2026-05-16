@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -77,10 +78,12 @@ func runClient(args []string, log *slog.Logger) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	storageRoot := defaultClientStorageRoot(*root)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	cfg := client.Config{
 		Root:         *root,
+		StorageRoot:  storageRoot,
 		StatePath:    *statePath,
 		ServerURL:    *serverURL,
 		Token:        *token,
@@ -126,6 +129,20 @@ func runClient(args []string, log *slog.Logger) error {
 	}
 	log.Info("xcloud client started", "mode", "single-root", "root", *root, "server", *serverURL, "suggested_space", *spaceID, "interval", *interval)
 	return engine.Run(ctx)
+}
+
+func defaultClientStorageRoot(root string) string {
+	if root != "" {
+		if abs, err := filepath.Abs(root); err == nil {
+			return abs
+		}
+		return root
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "xcloud"
+	}
+	return filepath.Join(cwd, "xcloud")
 }
 
 func usage() {

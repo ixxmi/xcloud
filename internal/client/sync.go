@@ -24,6 +24,7 @@ import (
 
 type Config struct {
 	Root         string
+	StorageRoot  string
 	LocalRoot    string
 	StatePath    string
 	ServerURL    string
@@ -100,8 +101,19 @@ func NewEngine(cfg Config) (*Engine, error) {
 		return nil, err
 	}
 	cfg.Root = rootAbs
-	if cfg.LocalRoot == "" {
+	if cfg.LocalRoot == "" && cfg.StorageRoot == "" {
 		cfg.LocalRoot = cfg.Root
+		cfg.StorageRoot = cfg.Root
+	} else if cfg.StorageRoot == "" {
+		cfg.StorageRoot = cfg.LocalRoot
+	}
+	storageRootAbs, err := filepath.Abs(cfg.StorageRoot)
+	if err != nil {
+		return nil, err
+	}
+	cfg.StorageRoot = storageRootAbs
+	if cfg.LocalRoot == "" {
+		cfg.LocalRoot = localRootFor(cfg.StorageRoot, cfg.Root, cfg.SpaceID)
 	}
 	localRootAbs, err := filepath.Abs(cfg.LocalRoot)
 	if err != nil {
@@ -160,10 +172,20 @@ func NewSupervisor(cfg Config) (*Supervisor, error) {
 		}
 		cfg.Root = filepath.Join(cwd, "xcloud")
 	}
-	if cfg.LocalRoot == "" {
-		cfg.LocalRoot = cfg.Root
+	rootAbs, err := filepath.Abs(cfg.Root)
+	if err != nil {
+		return nil, err
 	}
-	if err := os.MkdirAll(cfg.LocalRoot, 0o755); err != nil {
+	cfg.Root = rootAbs
+	if cfg.StorageRoot == "" {
+		cfg.StorageRoot = cfg.Root
+	}
+	storageRootAbs, err := filepath.Abs(cfg.StorageRoot)
+	if err != nil {
+		return nil, err
+	}
+	cfg.StorageRoot = storageRootAbs
+	if err := os.MkdirAll(cfg.StorageRoot, 0o755); err != nil {
 		return nil, err
 	}
 	if cfg.StatePath == "" {
@@ -241,6 +263,10 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 		return err
 	}
 	applySettingsToConfig(&s.cfg, status.Settings)
+	if err := s.applyStorageRoot(status.StorageRoot); err != nil {
+		return err
+	}
+	candidates[0] = s.cfg.Root
 	for _, req := range status.Requests {
 		if err := s.reportChildren(host, req); err != nil {
 			return err
@@ -265,6 +291,7 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 			DeviceID:         s.cfg.DeviceID,
 			Hostname:         host,
 			RootPath:         root,
+			StorageRoot:      s.cfg.StorageRoot,
 			Depth:            0,
 			SuggestedSpaceID: s.cfg.SpaceID,
 		})
@@ -315,7 +342,30 @@ func (s *Supervisor) accountSyncEnabled() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	applySettingsToConfig(&s.cfg, status.Settings)
+	if err := s.applyStorageRoot(status.StorageRoot); err != nil {
+		return false, err
+	}
 	return status.SyncEnabled, nil
+}
+
+func (s *Supervisor) applyStorageRoot(storageRoot string) error {
+	storageRoot = strings.TrimSpace(storageRoot)
+	if storageRoot == "" {
+		return nil
+	}
+	rootAbs, err := filepath.Abs(storageRoot)
+	if err != nil {
+		return err
+	}
+	if rootAbs == s.cfg.StorageRoot {
+		return nil
+	}
+	if err := os.MkdirAll(rootAbs, 0o755); err != nil {
+		return err
+	}
+	s.cfg.StorageRoot = rootAbs
+	return nil
 }
 
 func (s *Supervisor) reportChildren(host string, req syncmodel.FolderDiscoveryRequest) error {
@@ -336,6 +386,7 @@ func (s *Supervisor) reportChildren(host string, req syncmodel.FolderDiscoveryRe
 			DeviceID:         s.cfg.DeviceID,
 			Hostname:         host,
 			RootPath:         child,
+			StorageRoot:      s.cfg.StorageRoot,
 			ParentPath:       req.RootPath,
 			Depth:            req.Depth,
 			SuggestedSpaceID: s.cfg.SpaceID,
@@ -361,15 +412,23 @@ func (s *Supervisor) reportedDirKey(path string) string {
 
 func (s *Supervisor) engineFor(root, spaceID string) (*Engine, error) {
 	key := root + "\x00" + spaceID
+	localRoot := localRootFor(s.cfg.StorageRoot, root, spaceID)
 	s.mu.Lock()
 	if engine := s.engines[key]; engine != nil {
+		if engine.cfg.LocalRoot != localRoot {
+			engine.cfg.StorageRoot = s.cfg.StorageRoot
+			if err := engine.switchRoot(localRoot); err != nil {
+				s.mu.Unlock()
+				return nil, err
+			}
+		}
 		s.mu.Unlock()
 		return engine, nil
 	}
 	s.mu.Unlock()
 	cfg := s.cfg
 	cfg.Root = root
-	cfg.LocalRoot = root
+	cfg.LocalRoot = localRoot
 	cfg.SpaceID = spaceID
 	cfg.StatePath = filepath.Join(cfg.LocalRoot, ".xcloud", "state-"+safeStateName(spaceID)+".json")
 	engine, err := NewEngine(cfg)
@@ -579,12 +638,19 @@ func (e *Engine) accountSyncEnabled() (bool, error) {
 		return false, err
 	}
 	applySettingsToConfig(&e.cfg, status.Settings)
-	for _, folder := range status.Selected {
-		if folder.RootPath == e.cfg.Root && folder.LocalPath != "" && folder.LocalPath != e.cfg.LocalRoot {
-			if err := e.switchRoot(folder.LocalPath); err != nil {
+	if strings.TrimSpace(status.StorageRoot) != "" {
+		storageRootAbs, err := filepath.Abs(status.StorageRoot)
+		if err != nil {
+			return false, err
+		}
+		if storageRootAbs != e.cfg.StorageRoot {
+			e.cfg.StorageRoot = storageRootAbs
+		}
+		targetRoot := localRootFor(e.cfg.StorageRoot, e.cfg.Root, e.cfg.SpaceID)
+		if targetRoot != e.cfg.LocalRoot {
+			if err := e.switchRoot(targetRoot); err != nil {
 				return false, err
 			}
-			break
 		}
 	}
 	return status.SyncEnabled, nil
@@ -635,6 +701,7 @@ func (e *Engine) ensureFolderSelected() (bool, error) {
 		DeviceID:         e.cfg.DeviceID,
 		Hostname:         host,
 		RootPath:         e.cfg.Root,
+		StorageRoot:      e.cfg.StorageRoot,
 		SuggestedSpaceID: e.cfg.SpaceID,
 	})
 	if err != nil {
@@ -1048,6 +1115,30 @@ func conflictLocalPath(path, deviceID string) string {
 		return '-'
 	}, deviceID)
 	return fmt.Sprintf("%s (local conflict from %s at %s)%s", stem, safeDevice, time.Now().Format("20060102-150405"), ext)
+}
+
+func localRootFor(storageRoot, root, spaceID string) string {
+	if storageRoot == "" {
+		storageRoot = root
+	}
+	storageRootAbs, storageErr := filepath.Abs(storageRoot)
+	rootAbs, rootErr := filepath.Abs(root)
+	if storageErr == nil && rootErr == nil {
+		if fileutil.PathWithin(storageRootAbs, rootAbs) {
+			return rootAbs
+		}
+		storageRoot = storageRootAbs
+		root = rootAbs
+	}
+	if spaceID == "" {
+		spaceID = "default"
+	}
+	sum := sha256.Sum256([]byte(root))
+	base := safeStateName(filepath.Base(root))
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		base = "root"
+	}
+	return filepath.Join(storageRoot, safeStateName(spaceID), hex.EncodeToString(sum[:])[:12]+"-"+base)
 }
 
 func discoverRootFolders() ([]string, error) {

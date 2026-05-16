@@ -88,6 +88,16 @@ type ClientToken struct {
 	LastUsedAt int64  `json:"last_used_at,omitempty"`
 }
 
+type ClientDevice struct {
+	AccountID   string `json:"account_id"`
+	DeviceID    string `json:"device_id"`
+	Hostname    string `json:"hostname,omitempty"`
+	StorageRoot string `json:"storage_root,omitempty"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
+	LastSeenAt  int64  `json:"last_seen_at,omitempty"`
+}
+
 type SyncSpace struct {
 	ID          string `json:"id"`
 	AccountID   string `json:"account_id"`
@@ -104,7 +114,6 @@ type ClientFolder struct {
 	DeviceID            string `json:"device_id"`
 	Hostname            string `json:"hostname,omitempty"`
 	RootPath            string `json:"root_path"`
-	LocalPath           string `json:"local_path,omitempty"`
 	ParentPath          string `json:"parent_path,omitempty"`
 	Depth               int    `json:"depth"`
 	SuggestedSpaceID    string `json:"suggested_space_id,omitempty"`
@@ -169,6 +178,7 @@ type LocalFileState struct {
 type ServerState struct {
 	Accounts      map[string]*Account       `json:"accounts"`
 	ClientTokens  map[string]*ClientToken   `json:"client_tokens,omitempty"`
+	ClientDevices map[string]*ClientDevice  `json:"client_devices,omitempty"`
 	Spaces        map[string]*SyncSpace     `json:"spaces"`
 	ClientFolders map[string]*ClientFolder  `json:"client_folders"`
 	Files         map[string]*FileEntry     `json:"files"`
@@ -214,6 +224,7 @@ type FolderReportRequest struct {
 	DeviceID         string `json:"device_id"`
 	Hostname         string `json:"hostname,omitempty"`
 	RootPath         string `json:"root_path"`
+	StorageRoot      string `json:"storage_root,omitempty"`
 	ParentPath       string `json:"parent_path,omitempty"`
 	Depth            int    `json:"depth,omitempty"`
 	SuggestedSpaceID string `json:"suggested_space_id,omitempty"`
@@ -231,9 +242,10 @@ type FolderReportResponse struct {
 }
 
 type FolderStatusResponse struct {
-	Requests []FolderDiscoveryRequest `json:"requests"`
-	Selected []ClientFolder           `json:"selected"`
-	Settings SyncSettings             `json:"settings"`
+	Requests    []FolderDiscoveryRequest `json:"requests"`
+	Selected    []ClientFolder           `json:"selected"`
+	Settings    SyncSettings             `json:"settings"`
+	StorageRoot string                   `json:"storage_root,omitempty"`
 }
 
 type FolderChildrenCompleteRequest struct {
@@ -242,10 +254,11 @@ type FolderChildrenCompleteRequest struct {
 }
 
 type ClientLoginRequest struct {
-	Identifier string `json:"identifier"`
-	Password   string `json:"password"`
-	DeviceID   string `json:"device_id,omitempty"`
-	Hostname   string `json:"hostname,omitempty"`
+	Identifier  string `json:"identifier"`
+	Password    string `json:"password"`
+	DeviceID    string `json:"device_id,omitempty"`
+	Hostname    string `json:"hostname,omitempty"`
+	StorageRoot string `json:"storage_root,omitempty"`
 }
 
 type ClientLoginResponse struct {
@@ -254,6 +267,7 @@ type ClientLoginResponse struct {
 	SpaceID     string         `json:"space_id"`
 	SyncEnabled bool           `json:"sync_enabled"`
 	Settings    SyncSettings   `json:"settings"`
+	StorageRoot string         `json:"storage_root,omitempty"`
 }
 
 type ClientStatusResponse struct {
@@ -261,6 +275,7 @@ type ClientStatusResponse struct {
 	SpaceID     string         `json:"space_id"`
 	SyncEnabled bool           `json:"sync_enabled"`
 	Settings    SyncSettings   `json:"settings"`
+	StorageRoot string         `json:"storage_root,omitempty"`
 	Selected    []ClientFolder `json:"selected,omitempty"`
 }
 
@@ -275,10 +290,10 @@ type SyncSettingsUpdateRequest struct {
 	IntervalSeconds int    `json:"interval_seconds"`
 }
 
-type FolderLocalPathRequest struct {
-	AccountID string `json:"account_id,omitempty"`
-	FolderID  string `json:"folder_id"`
-	LocalPath string `json:"local_path"`
+type ClientStorageRootRequest struct {
+	AccountID   string `json:"account_id,omitempty"`
+	DeviceID    string `json:"device_id"`
+	StorageRoot string `json:"storage_root"`
 }
 
 type SyncRecordRequest struct {

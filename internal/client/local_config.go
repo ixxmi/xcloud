@@ -13,6 +13,7 @@ import (
 type LocalConfig struct {
 	ServerURL    string                 `json:"server_url"`
 	Token        string                 `json:"token,omitempty"`
+	StorageRoot  string                 `json:"storage_root,omitempty"`
 	SpaceID      string                 `json:"space_id,omitempty"`
 	DeviceID     string                 `json:"device_id,omitempty"`
 	Username     string                 `json:"username,omitempty"`
