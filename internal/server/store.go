@@ -666,6 +666,9 @@ func (s *Store) SetAccountDisabled(accountID string, disabled bool) error {
 func (s *Store) ListSpaces(accountID string) []syncmodel.SpaceSummary {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.pruneTrashLocked(time.Now().Unix()) {
+		defer func() { _ = s.saveLocked() }()
+	}
 	out := []syncmodel.SpaceSummary{}
 	for _, space := range s.state.Spaces {
 		if space.AccountID != accountID {
@@ -678,13 +681,11 @@ func (s *Store) ListSpaces(accountID string) []syncmodel.SpaceSummary {
 			}
 			if entry.Deleted {
 				summary.Deleted++
+				if entry.Current != nil && entry.Current.DeletedAt > 0 {
+					summary.Trash++
+				}
 			} else {
 				summary.FileCount++
-			}
-		}
-		for _, folder := range s.state.ClientFolders {
-			if folder.AccountID == accountID && folder.SpaceID == space.ID && folder.Status == syncmodel.FolderSelected {
-				summary.Folders++
 			}
 		}
 		out = append(out, summary)
@@ -874,6 +875,20 @@ func (s *Store) ClientStatus(accountID, deviceID string) syncmodel.ClientStatusR
 	} else if device := s.state.ClientDevices[deviceKey(accountID, deviceID)]; device != nil {
 		resp.StorageRoot = device.StorageRoot
 	}
+	for _, space := range s.state.Spaces {
+		if space.AccountID == accountID && space.Active {
+			resp.Spaces = append(resp.Spaces, *space)
+		}
+	}
+	sort.Slice(resp.Spaces, func(i, j int) bool {
+		if resp.Spaces[i].ID == "default" {
+			return true
+		}
+		if resp.Spaces[j].ID == "default" {
+			return false
+		}
+		return resp.Spaces[i].Name < resp.Spaces[j].Name
+	})
 	for _, folder := range s.state.ClientFolders {
 		if folder.AccountID != accountID {
 			continue
@@ -994,6 +1009,28 @@ func (s *Store) SetClientStorageRoot(accountID, deviceID, storageRoot string) er
 		}
 	}
 	return s.saveLocked()
+}
+
+func (s *Store) TouchClientDevice(accountID, deviceID, hostname, storageRoot string) {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return
+	}
+	hostname = strings.TrimSpace(hostname)
+	storageRoot = strings.TrimSpace(storageRoot)
+	if storageRoot != "" && !isClientAbsolutePath(storageRoot) {
+		storageRoot = ""
+	}
+	storageRoot = cleanClientPath(storageRoot)
+	now := time.Now().Unix()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	device := s.ensureClientDeviceLocked(accountID, deviceID, hostname, now)
+	if storageRoot != "" && device.StorageRoot == "" {
+		device.StorageRoot = storageRoot
+		device.UpdatedAt = now
+	}
+	_ = s.saveLocked()
 }
 
 func isClientAbsolutePath(path string) bool {
@@ -1350,6 +1387,22 @@ func (s *Store) Delete(accountID, spaceID string, req syncmodel.DeleteRequest) (
 	}
 
 	now := time.Now().Unix()
+	if entry.Current != nil && entry.Current.State == syncmodel.EntryDeleted {
+		resp := syncmodel.CommitResponse{
+			Status:  "ok",
+			Entry:   *entry,
+			Version: *entry.Current,
+		}
+		s.state.Operations[opKey] = resp
+		if err := s.saveLocked(); err != nil {
+			return syncmodel.CommitResponse{}, err
+		}
+		return resp, nil
+	}
+	var previous syncmodel.FileVersion
+	if entry.Current != nil {
+		previous = *entry.Current
+	}
 	version := syncmodel.FileVersion{
 		AccountID:   accountID,
 		SpaceID:     spaceID,
@@ -1358,6 +1411,10 @@ func (s *Store) Delete(accountID, spaceID string, req syncmodel.DeleteRequest) (
 		VersionID:   fileutil.NewID(),
 		BaseVersion: req.BaseVersion,
 		State:       syncmodel.EntryDeleted,
+		Size:        previous.Size,
+		Hash:        previous.Hash,
+		Chunks:      append([]syncmodel.ChunkRef(nil), previous.Chunks...),
+		ModTimeUnix: previous.ModTimeUnix,
 		DeletedAt:   now,
 		DeviceID:    req.DeviceID,
 		RootPath:    req.RootPath,
@@ -1376,6 +1433,127 @@ func (s *Store) Delete(accountID, spaceID string, req syncmodel.DeleteRequest) (
 		Version: version,
 	}
 	s.state.Operations[opKey] = resp
+	if err := s.saveLocked(); err != nil {
+		return syncmodel.CommitResponse{}, err
+	}
+	return resp, nil
+}
+
+func (s *Store) ListTrash(accountID string, limit int) []syncmodel.TrashEntry {
+	if limit <= 0 {
+		limit = 200
+	}
+	now := time.Now().Unix()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pruneTrashLocked(now) {
+		_ = s.saveLocked()
+	}
+	out := make([]syncmodel.TrashEntry, 0, limit)
+	for _, entry := range s.state.Files {
+		if entry.AccountID != accountID || !entry.Deleted || entry.Current == nil || entry.Current.State != syncmodel.EntryDeleted {
+			continue
+		}
+		trash := trashEntryFromVersion(*entry.Current)
+		if trash.ExpiresAt <= now {
+			continue
+		}
+		out = append(out, trash)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].DeletedAt > out[j].DeletedAt
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func (s *Store) RestoreTrash(accountID string, req syncmodel.RestoreRequest, actor string) (syncmodel.CommitResponse, error) {
+	spaceID := strings.TrimSpace(req.SpaceID)
+	if spaceID == "" {
+		spaceID = "default"
+	}
+	if _, ok := s.GetSpace(accountID, spaceID); !ok {
+		return syncmodel.CommitResponse{}, errors.New("sync space not found")
+	}
+	path, err := fileutil.CleanRel(req.Path)
+	if err != nil {
+		return syncmodel.CommitResponse{}, err
+	}
+	fileID := strings.TrimSpace(req.FileID)
+	if fileID == "" {
+		return syncmodel.CommitResponse{}, errors.New("file_id is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	pruned := s.pruneTrashLocked(now)
+	entry := s.state.Files[fileKey(accountID, spaceID, path)]
+	if entry == nil || entry.FileID != fileID || !entry.Deleted || entry.Current == nil || entry.Current.State != syncmodel.EntryDeleted {
+		if pruned {
+			_ = s.saveLocked()
+		}
+		return syncmodel.CommitResponse{}, errors.New("trash entry not found")
+	}
+	if entry.Current.DeletedAt+syncmodel.TrashRetentionSeconds <= now {
+		if pruned {
+			_ = s.saveLocked()
+		}
+		return syncmodel.CommitResponse{}, errors.New("trash entry has expired")
+	}
+	versions := s.state.Versions[fileID]
+	var source *syncmodel.FileVersion
+	for i := len(versions) - 1; i >= 0; i-- {
+		if versions[i].State == syncmodel.EntryFile {
+			copy := versions[i]
+			source = &copy
+			break
+		}
+	}
+	if source == nil && entry.Current.Hash != "" {
+		copy := *entry.Current
+		copy.State = syncmodel.EntryFile
+		source = &copy
+	}
+	if source == nil {
+		if pruned {
+			_ = s.saveLocked()
+		}
+		return syncmodel.CommitResponse{}, errors.New("restorable version not found")
+	}
+	deviceID := "admin"
+	if strings.TrimSpace(actor) != "" {
+		deviceID = "admin-" + safeDeviceName(actor)
+	}
+	version := syncmodel.FileVersion{
+		AccountID:   accountID,
+		SpaceID:     spaceID,
+		FileID:      entry.FileID,
+		Path:        path,
+		VersionID:   fileutil.NewID(),
+		BaseVersion: entry.Current.VersionID,
+		State:       syncmodel.EntryFile,
+		Size:        source.Size,
+		Hash:        source.Hash,
+		Chunks:      append([]syncmodel.ChunkRef(nil), source.Chunks...),
+		ModTimeUnix: now,
+		DeviceID:    deviceID,
+		RootPath:    "cloud-trash",
+		CreatedAt:   now,
+	}
+	entry.Current = &version
+	entry.Deleted = false
+	entry.LatestVersion = version.VersionID
+	entry.UpdatedAt = now
+	s.state.Versions[entry.FileID] = append(s.state.Versions[entry.FileID], version)
+	s.appendEventLocked(version)
+	resp := syncmodel.CommitResponse{
+		Status:  "ok",
+		Entry:   *entry,
+		Version: version,
+	}
 	if err := s.saveLocked(); err != nil {
 		return syncmodel.CommitResponse{}, err
 	}
@@ -1550,6 +1728,36 @@ func (s *Store) appendEventLocked(version syncmodel.FileVersion) {
 	}
 }
 
+func (s *Store) pruneTrashLocked(now int64) bool {
+	changed := false
+	for key, entry := range s.state.Files {
+		if entry == nil || !entry.Deleted || entry.Current == nil || entry.Current.State != syncmodel.EntryDeleted {
+			continue
+		}
+		if entry.Current.DeletedAt <= 0 || entry.Current.DeletedAt+syncmodel.TrashRetentionSeconds > now {
+			continue
+		}
+		delete(s.state.Files, key)
+		changed = true
+	}
+	return changed
+}
+
+func trashEntryFromVersion(version syncmodel.FileVersion) syncmodel.TrashEntry {
+	return syncmodel.TrashEntry{
+		AccountID: version.AccountID,
+		SpaceID:   version.SpaceID,
+		FileID:    version.FileID,
+		Path:      version.Path,
+		VersionID: version.VersionID,
+		Size:      version.Size,
+		Hash:      version.Hash,
+		DeletedAt: version.DeletedAt,
+		ExpiresAt: version.DeletedAt + syncmodel.TrashRetentionSeconds,
+		DeviceID:  version.DeviceID,
+	}
+}
+
 func (s *Store) nextConflictPathLocked(path, deviceID string, ts int64) string {
 	ext := filepath.Ext(path)
 	stem := strings.TrimSuffix(path, ext)
@@ -1574,6 +1782,20 @@ func (s *Store) conflictPathExistsLocked(_, candidate string) bool {
 		}
 	}
 	return false
+}
+
+func safeDeviceName(v string) string {
+	v = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return '-'
+	}, v)
+	v = strings.Trim(v, "-")
+	if v == "" {
+		return "admin"
+	}
+	return v
 }
 
 func fileKey(accountID, spaceID, path string) string {

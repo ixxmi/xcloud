@@ -5,6 +5,7 @@ const (
 	DefaultSyncIntervalSeconds = 10
 	DefaultSyncDebounceMillis  = 800
 	MaxSyncRecordsPerAccount   = 5000
+	TrashRetentionSeconds      = 10 * 24 * 60 * 60
 
 	EntryFile    = "file"
 	EntryDeleted = "deleted"
@@ -206,6 +207,19 @@ type SyncRecord struct {
 	CreatedAt      int64  `json:"created_at"`
 }
 
+type TrashEntry struct {
+	AccountID string `json:"account_id,omitempty"`
+	SpaceID   string `json:"space_id,omitempty"`
+	FileID    string `json:"file_id"`
+	Path      string `json:"path"`
+	VersionID string `json:"version_id"`
+	Size      int64  `json:"size"`
+	Hash      string `json:"hash,omitempty"`
+	DeletedAt int64  `json:"deleted_at"`
+	ExpiresAt int64  `json:"expires_at"`
+	DeviceID  string `json:"device_id,omitempty"`
+}
+
 type Event struct {
 	AccountID string      `json:"account_id,omitempty"`
 	SpaceID   string      `json:"space_id,omitempty"`
@@ -276,6 +290,7 @@ type ClientStatusResponse struct {
 	SyncEnabled bool           `json:"sync_enabled"`
 	Settings    SyncSettings   `json:"settings"`
 	StorageRoot string         `json:"storage_root,omitempty"`
+	Spaces      []SyncSpace    `json:"spaces,omitempty"`
 	Selected    []ClientFolder `json:"selected,omitempty"`
 }
 
@@ -350,6 +365,13 @@ type DeleteRequest struct {
 	BaseVersion string `json:"base_version,omitempty"`
 }
 
+type RestoreRequest struct {
+	AccountID string `json:"account_id,omitempty"`
+	SpaceID   string `json:"space_id"`
+	FileID    string `json:"file_id"`
+	Path      string `json:"path"`
+}
+
 type ListResponse struct {
 	Files []FileEntry `json:"files"`
 }
@@ -367,4 +389,5 @@ type SpaceSummary struct {
 	FileCount int       `json:"file_count"`
 	Deleted   int       `json:"deleted"`
 	Folders   int       `json:"folders"`
+	Trash     int       `json:"trash"`
 }

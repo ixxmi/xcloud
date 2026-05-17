@@ -58,10 +58,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/accounts/change-password", s.requireLogin(s.adminChangePassword))
 	mux.HandleFunc("POST /admin/spaces/create", s.requireLogin(s.adminCreateSpace))
 	mux.HandleFunc("POST /admin/spaces/toggle", s.requireLogin(s.adminToggleSpace))
-	mux.HandleFunc("POST /admin/folders/select", s.requireLogin(s.adminSelectFolder))
-	mux.HandleFunc("POST /admin/folders/disable", s.requireLogin(s.adminDisableFolder))
-	mux.HandleFunc("POST /admin/folders/expand", s.requireLogin(s.adminExpandFolder))
 	mux.HandleFunc("POST /admin/clients/storage-root", s.requireLogin(s.adminSetClientStorageRoot))
+	mux.HandleFunc("POST /admin/trash/restore", s.requireLogin(s.adminRestoreTrash))
 	mux.HandleFunc("POST /admin/sync-settings/update", s.requireLogin(s.adminUpdateSyncSettings))
 
 	mux.HandleFunc("POST /v1/client/login", s.clientLogin)
@@ -116,17 +114,14 @@ func (s *Server) syncAuth(next func(http.ResponseWriter, *http.Request, syncCont
 		rootPath := strings.TrimSpace(r.Header.Get("X-XCloud-Root"))
 		if r.URL.Path != "/v1/folders/report" && r.URL.Path != "/v1/folders/status" && r.URL.Path != "/v1/folders/children-complete" {
 			if deviceID == "" || rootPath == "" {
-				writeJSON(w, http.StatusForbidden, syncmodel.ErrorResponse{Error: "client folder has not been reported"})
+				writeJSON(w, http.StatusForbidden, syncmodel.ErrorResponse{Error: "client device and root are required"})
 				return
 			}
 			if _, ok := s.store.GetSpace(account.ID, spaceID); !ok {
 				writeJSON(w, http.StatusForbidden, syncmodel.ErrorResponse{Error: "sync space not found"})
 				return
 			}
-			if !s.store.FolderSelected(account.ID, deviceID, rootPath, spaceID) {
-				writeJSON(w, http.StatusForbidden, syncmodel.ErrorResponse{Error: "client folder is not selected for sync"})
-				return
-			}
+			s.store.TouchClientDevice(account.ID, deviceID, "", "")
 		}
 		next(w, r, syncContext{account: *account, spaceID: spaceID, deviceID: deviceID, rootPath: rootPath})
 	}
@@ -475,7 +470,7 @@ func (s *Server) adminCreateSpace(w http.ResponseWriter, r *http.Request, accoun
 		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "spaces"})
 		return
 	}
-	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: fmt.Sprintf("Space %s 已创建。客户端可用 -space %s 作为上报建议，最终由网关选择生效。", space.Name, space.ID)}, dashboardOptions{View: "spaces"})
+	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: fmt.Sprintf("Space %s 已创建。客户端使用 -space %s 时会同步 xcloud/%s。", space.Name, space.ID, space.ID)}, dashboardOptions{View: "spaces"})
 }
 
 func (s *Server) adminToggleSpace(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
@@ -498,66 +493,6 @@ func (s *Server) adminToggleSpace(w http.ResponseWriter, r *http.Request, accoun
 	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "Space 状态已更新"}, dashboardOptions{View: "spaces"})
 }
 
-func (s *Server) adminSelectFolder(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
-	if err := r.ParseForm(); err != nil {
-		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "spaces"})
-		return
-	}
-	accountID := r.Form.Get("account_id")
-	if accountID == "" {
-		accountID = account.ID
-	}
-	if accountID != account.ID && !account.IsAdmin {
-		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: "没有权限选择其他账号的客户端目录"}, dashboardOptions{View: "spaces"})
-		return
-	}
-	if err := s.store.SelectFolder(accountID, r.Form.Get("folder_id"), r.Form.Get("space_id")); err != nil {
-		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "spaces"})
-		return
-	}
-	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "客户端目录已选择，客户端下一轮同步会开始工作"}, dashboardOptions{View: "spaces"})
-}
-
-func (s *Server) adminDisableFolder(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
-	if err := r.ParseForm(); err != nil {
-		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "spaces"})
-		return
-	}
-	accountID := r.Form.Get("account_id")
-	if accountID == "" {
-		accountID = account.ID
-	}
-	if accountID != account.ID && !account.IsAdmin {
-		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: "没有权限停用其他账号的客户端目录"}, dashboardOptions{View: "spaces"})
-		return
-	}
-	if err := s.store.DisableFolder(accountID, r.Form.Get("folder_id")); err != nil {
-		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "spaces"})
-		return
-	}
-	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "客户端目录已停用"}, dashboardOptions{View: "spaces"})
-}
-
-func (s *Server) adminExpandFolder(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
-	if err := r.ParseForm(); err != nil {
-		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "spaces"})
-		return
-	}
-	accountID := r.Form.Get("account_id")
-	if accountID == "" {
-		accountID = account.ID
-	}
-	if accountID != account.ID && !account.IsAdmin {
-		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: "没有权限展开其他账号的客户端目录"}, dashboardOptions{View: "spaces"})
-		return
-	}
-	if err := s.store.RequestChildren(accountID, r.Form.Get("folder_id")); err != nil {
-		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "spaces"})
-		return
-	}
-	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "已请求客户端上报下一级目录，客户端下一轮同步后会出现在列表中"}, dashboardOptions{View: "spaces"})
-}
-
 func (s *Server) adminSetClientStorageRoot(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
 	if err := r.ParseForm(); err != nil {
 		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "spaces"})
@@ -575,7 +510,32 @@ func (s *Server) adminSetClientStorageRoot(w http.ResponseWriter, r *http.Reques
 		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "spaces"})
 		return
 	}
-	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "客户端全局保存目录已更新，客户端下一轮状态刷新后生效"}, dashboardOptions{View: "spaces"})
+	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "客户端全局 xcloud 保存目录已更新，客户端下一轮状态刷新后生效"}, dashboardOptions{View: "spaces"})
+}
+
+func (s *Server) adminRestoreTrash(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
+	if err := r.ParseForm(); err != nil {
+		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "trash"})
+		return
+	}
+	accountID := r.Form.Get("account_id")
+	if accountID == "" {
+		accountID = account.ID
+	}
+	if accountID != account.ID && !account.IsAdmin {
+		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: "没有权限恢复其他账号的文件"}, dashboardOptions{View: "trash"})
+		return
+	}
+	req := syncmodel.RestoreRequest{
+		SpaceID: r.Form.Get("space_id"),
+		FileID:  r.Form.Get("file_id"),
+		Path:    r.Form.Get("path"),
+	}
+	if _, err := s.store.RestoreTrash(accountID, req, account.Username); err != nil {
+		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "trash"})
+		return
+	}
+	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "文件已从云端回收站恢复，所有客户端下一轮同步会恢复该文件"}, dashboardOptions{View: "trash"})
 }
 
 func (s *Server) adminUpdateSyncSettings(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
@@ -702,90 +662,15 @@ func (s *Server) renderDashboard(w http.ResponseWriter, account syncmodel.Accoun
 	if account.IsAdmin {
 		accounts = s.store.ListAccounts()
 	}
-	type folderView struct {
-		Folder     syncmodel.ClientFolder
-		Spaces     []syncmodel.SpaceSummary
-		Indent     int
-		Base       string
-		HasParent  bool
-		HasLoading bool
-	}
 	type spaceGroup struct {
 		Account           syncmodel.Account
 		Spaces            []syncmodel.SpaceSummary
-		Folders           []folderView
 		Devices           []syncmodel.ClientDevice
 		HasDuplicateNames bool
 		DuplicateNames    []string
+		Trash             []syncmodel.TrashEntry
 		Records           []syncmodel.SyncRecord
 		Settings          syncmodel.SyncSettings
-	}
-	buildFolderViews := func(folders []syncmodel.ClientFolder, spaces []syncmodel.SpaceSummary) []folderView {
-		treeKey := func(deviceID, rootPath string) string {
-			return deviceID + "\x00" + rootPath
-		}
-		childrenByParent := map[string][]syncmodel.ClientFolder{}
-		seen := map[string]bool{}
-		for _, folder := range folders {
-			seen[treeKey(folder.DeviceID, folder.RootPath)] = true
-			childrenByParent[treeKey(folder.DeviceID, folder.ParentPath)] = append(childrenByParent[treeKey(folder.DeviceID, folder.ParentPath)], folder)
-		}
-		for parent := range childrenByParent {
-			sort.Slice(childrenByParent[parent], func(i, j int) bool {
-				left := childrenByParent[parent][i]
-				right := childrenByParent[parent][j]
-				if left.DeviceID != right.DeviceID {
-					return left.DeviceID < right.DeviceID
-				}
-				if left.Depth != right.Depth {
-					return left.Depth < right.Depth
-				}
-				return left.RootPath < right.RootPath
-			})
-		}
-		visited := map[string]bool{}
-		out := []folderView{}
-		var appendNode func(folder syncmodel.ClientFolder)
-		appendNode = func(folder syncmodel.ClientFolder) {
-			key := treeKey(folder.DeviceID, folder.RootPath)
-			if visited[key] {
-				return
-			}
-			visited[key] = true
-			out = append(out, folderView{
-				Folder:     folder,
-				Spaces:     spaces,
-				Indent:     folder.Depth * 18,
-				Base:       pathBase(folder.RootPath),
-				HasParent:  folder.ParentPath != "",
-				HasLoading: folder.ChildrenRequested && !folder.ChildrenReported,
-			})
-			for _, child := range childrenByParent[treeKey(folder.DeviceID, folder.RootPath)] {
-				appendNode(child)
-			}
-		}
-		roots := []syncmodel.ClientFolder{}
-		for _, folder := range folders {
-			if folder.ParentPath == "" || !seen[treeKey(folder.DeviceID, folder.ParentPath)] {
-				roots = append(roots, folder)
-			}
-		}
-		sort.Slice(roots, func(i, j int) bool {
-			if roots[i].DeviceID != roots[j].DeviceID {
-				return roots[i].DeviceID < roots[j].DeviceID
-			}
-			if roots[i].Depth != roots[j].Depth {
-				return roots[i].Depth < roots[j].Depth
-			}
-			return roots[i].RootPath < roots[j].RootPath
-		})
-		for _, folder := range roots {
-			appendNode(folder)
-		}
-		for _, folder := range folders {
-			appendNode(folder)
-		}
-		return out
 	}
 	groups := make([]spaceGroup, 0, len(accounts))
 	totalSpaces := 0
@@ -794,9 +679,7 @@ func (s *Server) renderDashboard(w http.ResponseWriter, account syncmodel.Accoun
 	activeSpaces := 0
 	for _, item := range accounts {
 		spaces := s.store.ListSpaces(item.ID)
-		folders := s.store.ListFolders(item.ID)
 		devices := s.store.ListClientDevices(item.ID)
-		folderViews := buildFolderViews(folders, spaces)
 		deviceNames := map[string]int{}
 		for _, device := range devices {
 			name := strings.TrimSpace(device.Hostname)
@@ -823,10 +706,10 @@ func (s *Server) renderDashboard(w http.ResponseWriter, account syncmodel.Accoun
 		groups = append(groups, spaceGroup{
 			Account:           item,
 			Spaces:            spaces,
-			Folders:           folderViews,
 			Devices:           devices,
 			HasDuplicateNames: len(duplicateNames) > 0,
 			DuplicateNames:    duplicateNames,
+			Trash:             s.store.ListTrash(item.ID, 200),
 			Records:           s.store.ListSyncRecords(item.ID, 120),
 			Settings:          syncmodel.NormalizeSyncSettings(item.SyncSettings),
 		})
@@ -907,18 +790,6 @@ func formatUnixTime(ts int64) string {
 	return time.Unix(ts, 0).Format("2006-01-02 15:04:05")
 }
 
-func pathBase(path string) string {
-	path = strings.TrimRight(strings.ReplaceAll(path, "\\", "/"), "/")
-	if path == "" {
-		return "/"
-	}
-	idx := strings.LastIndex(path, "/")
-	if idx >= 0 && idx < len(path)-1 {
-		return path[idx+1:]
-	}
-	return path
-}
-
 const authHTML = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -951,11 +822,11 @@ const authHTML = `<!doctype html>
       <div class="brand"><div class="logo">X</div><span>xcloud 控制台</span></div>
       <div class="hero">
         <h1>账号隔离的文件同步中心</h1>
-        <p>管理账号、同步 token、客户端目录和 Space。每个账号的数据只在自己的 Space 内流转，服务端负责版本协调、冲突保留和 chunk 校验。</p>
+        <p>管理账号、同步 token、客户端、Space 和云端回收站。每个账号的数据只在自己的 Space 内流转，服务端负责版本协调、删除保留和 chunk 校验。</p>
       </div>
       <div class="metrics">
         <div class="metric"><strong>SHA-256</strong><span>端到端完整性校验</span></div>
-        <div class="metric"><strong>Space</strong><span>账号内多目录隔离</span></div>
+        <div class="metric"><strong>Space</strong><span>账号内项目隔离</span></div>
         <div class="metric"><strong>Token</strong><span>客户端同步凭证</span></div>
       </div>
     </section>
@@ -985,7 +856,7 @@ const authHTML = `<!doctype html>
         <p class="foot">已有账号？<a class="link" href="/admin?view=login">返回登录</a></p>
         {{else}}
         <h2>欢迎回来</h2>
-        <p class="sub">使用用户名或邮箱登录管理你的客户端目录和 Space。</p>
+        <p class="sub">使用用户名或邮箱登录管理你的客户端、Space 和回收站。</p>
         <form method="post" action="/admin/login">
           <label>账号或邮箱</label>
           <div class="field"><span class="ico">ID</span><input name="identifier" autocomplete="username" placeholder="用户名或邮箱" required></div>
@@ -1024,14 +895,14 @@ const dashboardHTML = `<!doctype html>
     .nav{padding:20px 14px;flex:1}.nav p{font-size:12px;text-transform:uppercase;letter-spacing:.6px;font-family:figmaMono,"SF Mono",Menlo,monospace;margin:10px 12px 14px}.nav button{width:100%;height:44px;display:flex;align-items:center;gap:10px;padding:0 14px;border-radius:9999px;color:var(--ink);font-size:16px;margin:6px 0;background:transparent;border:0;font-weight:480;cursor:pointer;text-align:left}.nav button.active{background:var(--ink);color:var(--canvas)}.nav button:not(.active):hover{background:var(--soft)}.logout{padding:18px;border-top:1px solid var(--hair)}.logout button{width:100%;height:42px;border:1px solid var(--ink);border-radius:9999px;background:var(--canvas);color:var(--ink);font-weight:480;cursor:pointer}
     .main{margin-left:268px;min-width:0;flex:1}.top{height:72px;background:var(--canvas);border-bottom:1px solid var(--hair);display:flex;align-items:center;justify-content:space-between;padding:0 32px;position:sticky;top:0;z-index:5}.top-left{display:flex;align-items:center;gap:14px;min-width:0}.menu-toggle{display:none;width:42px;height:42px;padding:0;align-items:center;justify-content:center}.search{height:42px;width:min(420px,48vw);display:flex;align-items:center;gap:8px;background:var(--soft);border:1px solid var(--hair);border-radius:9999px;padding:0 16px}.search input{border:0;background:transparent;outline:none;width:100%;font-size:16px}.user{display:flex;align-items:center;gap:12px}.avatar{width:38px;height:38px;border-radius:9999px;background:var(--lilac);color:var(--ink);display:flex;align-items:center;justify-content:center;font-weight:700;border:1px solid var(--ink)}.content{padding:32px;max-width:1320px;margin:0 auto}.hero{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:24px;padding:48px;border-radius:24px;background:var(--lime)}.hero h1{font-size:64px;line-height:1;margin:0 0 14px;letter-spacing:0;font-weight:340}.muted{color:var(--ink);font-size:16px;line-height:1.45;font-weight:330}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.stat{border:1px solid var(--ink);border-radius:24px;padding:22px;background:var(--canvas)}.stat:nth-child(2){background:var(--cream)}.stat:nth-child(3){background:var(--mint)}.stat:nth-child(4){background:var(--pink)}.stat .label{font-size:12px;text-transform:uppercase;letter-spacing:.6px;font-family:figmaMono,"SF Mono",Menlo,monospace;margin-bottom:10px}.stat strong{font-size:36px;font-weight:540}.stat .hint{font-size:13px;margin-top:10px}
     .two{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.8fr);gap:18px;margin-top:18px}.panel{background:var(--canvas);border:1px solid var(--hair);border-radius:24px;padding:24px;margin-bottom:18px}.panel:nth-child(2n){background:var(--cream)}.panel h2{font-size:26px;margin:0 0 14px;font-weight:540}.panel h3{font-size:20px;margin:20px 0 10px}.flash{border-radius:8px;padding:14px 16px;margin-bottom:18px;word-break:break-all;font-size:15px;border:1px solid var(--ink)}.flash.success{background:var(--mint)}.flash.error{background:var(--pink)}
-    .folder-list{border:1px solid var(--ink);border-radius:24px;background:var(--canvas);overflow:auto;max-height:560px}.folder-node{position:relative;background:var(--canvas);border-bottom:1px solid var(--hair)}.folder-node:last-child{border-bottom:0}.folder-node.selected{background:var(--lime)}.folder-node.disabled{opacity:.58}.folder-node.loading{background:var(--cream)}.folder-node.collapsed-child,.folder-node.device-hidden{display:none}.folder-row{display:grid;grid-template-columns:minmax(0,1fr) max-content;gap:12px;align-items:center;min-height:56px;padding:9px 12px;transition:background .16s}.folder-row:hover{background:var(--soft)}.folder-left{display:flex;align-items:center;gap:10px;min-width:0}.tree-indent{width:var(--indent);flex:0 0 var(--indent);height:1px}.branch{width:18px;height:28px;border-left:1px solid var(--ink);border-bottom:1px solid var(--ink);border-bottom-left-radius:8px;flex:0 0 18px}.folder-node.root .branch{border-color:transparent;width:0;flex-basis:0}.folder-icon{width:28px;height:28px;border-radius:9999px;background:var(--canvas);border:1px solid var(--ink);display:flex;align-items:center;justify-content:center;font-size:12px;flex:0 0 28px}.folder-copy{min-width:0}.folder-title{display:flex;align-items:center;gap:7px;min-width:0;flex-wrap:wrap}.folder-title strong{font-size:16px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px}.folder-path{font-size:12px;line-height:1.35;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:min(680px,50vw)}.folder-meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.folder-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;white-space:nowrap}.folder-actions form{margin:0}.folder-actions button,.folder-actions select{height:34px;padding:7px 12px;font-size:13px}.folder-actions select{width:130px}.select-form{display:flex;align-items:center;gap:6px}.mini{font-size:12px;line-height:1.35}.warn{background:var(--coral);color:var(--ink)}.loading-row{display:flex;align-items:center;gap:10px;padding:0 12px 10px;color:var(--ink);font-size:13px}.spinner{width:14px;height:14px;border:2px solid var(--ink);border-right-color:transparent;border-radius:9999px;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.empty-tree{padding:18px}
-    .device-filter{display:flex;align-items:end;gap:12px;margin:14px 0}.device-filter label{margin:0}.device-filter select{max-width:320px}.duplicate-alert{border:1px solid var(--ink);border-radius:8px;background:var(--coral);padding:10px 12px;margin:10px 0;font-size:13px;line-height:1.45}.device-list{display:grid;gap:10px}.device-card{border:1px solid var(--ink);border-radius:8px;background:var(--canvas);padding:14px}.device-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.device-title{min-width:0}.device-title strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.device-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end}.device-form button{height:42px}.device-meta{font-size:12px;line-height:1.4;margin-top:6px;word-break:break-all}
+    .mini{font-size:12px;line-height:1.35}.warn{background:var(--coral);color:var(--ink)}.empty-tree{padding:18px}
+    .duplicate-alert{border:1px solid var(--ink);border-radius:8px;background:var(--coral);padding:10px 12px;margin:10px 0;font-size:13px;line-height:1.45}.device-list{display:grid;gap:10px}.device-card{border:1px solid var(--ink);border-radius:8px;background:var(--canvas);padding:14px}.device-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.device-title{min-width:0}.device-title strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.device-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end}.device-form button{height:42px}.device-meta{font-size:12px;line-height:1.4;margin-top:6px;word-break:break-all}
     .record-list{display:grid;gap:8px}.record-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--hair);border-radius:8px;padding:12px;background:var(--canvas)}.record-main{min-width:0}.record-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.record-path{font-size:12px;word-break:break-all;margin-top:4px}.record-meta{font-size:12px;margin-top:5px}.record-side{text-align:right;font-size:12px;min-width:160px}
     table{width:100%;border-collapse:collapse;font-size:15px}th,td{border-bottom:1px solid var(--hair);text-align:left;padding:12px 8px;vertical-align:top}th{font-size:12px;text-transform:uppercase;letter-spacing:.6px;font-family:figmaMono,"SF Mono",Menlo,monospace}code,.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.cmd{background:var(--inverse);color:var(--inverse-ink);border-radius:8px;padding:14px;word-break:break-all}
     label{display:block;font-size:12px;font-weight:400;margin:12px 0 6px;font-family:figmaMono,"SF Mono",Menlo,monospace;text-transform:uppercase;letter-spacing:.6px}input,textarea,select{box-sizing:border-box;width:100%;border:1px solid var(--hair);border-radius:8px;padding:11px 12px;font-size:16px;background:var(--canvas);color:var(--ink)}input:focus,textarea:focus,select:focus{outline:none;border-color:var(--ink);box-shadow:0 0 0 3px var(--lime)}textarea{min-height:78px;resize:vertical}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.inline{display:inline}
     button{border:0;border-radius:9999px;background:var(--ink);color:var(--canvas);font-weight:480;font-size:15px;padding:10px 18px;cursor:pointer}.secondary{background:var(--canvas);color:var(--ink);border:1px solid var(--ink)}.danger{background:var(--magenta);color:var(--canvas)}.badge{display:inline-flex;align-items:center;min-height:24px;padding:0 9px;border-radius:9999px;font-size:12px;font-weight:480;background:var(--canvas);color:var(--ink);border:1px solid var(--ink)}.ok{background:var(--mint);color:var(--ink)}.off{background:var(--pink);color:var(--ink)}
     .view{display:none}.view.active{display:block}.overview-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.compact{max-width:760px}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.small-select{min-width:140px}.path{max-width:360px;word-break:break-all}
-    @media(max-width:980px){.side{width:min(300px,86vw);transform:translateX(-102%);transition:transform .22s ease}.shell.menu-open .side{transform:translateX(0)}.scrim{position:fixed;inset:0;background:rgba(0,0,0,.48);z-index:15}.shell.menu-open .scrim{display:block}.main{margin-left:0}.menu-toggle{display:inline-flex}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.two{grid-template-columns:1fr}.top{padding:0 16px}.content{padding:18px}.hero{flex-direction:column;padding:32px}.hero h1{font-size:48px}.folder-path{max-width:58vw}}@media(max-width:560px){.grid,.form-grid,.device-form{grid-template-columns:1fr}.search{display:none}.folder-row{grid-template-columns:1fr}.folder-actions{justify-content:flex-start;padding-left:calc(var(--indent) + 56px);flex-wrap:wrap}.folder-path{max-width:100%}.hero h1{font-size:40px}.user .muted{display:none}}
+    @media(max-width:980px){.side{width:min(300px,86vw);transform:translateX(-102%);transition:transform .22s ease}.shell.menu-open .side{transform:translateX(0)}.scrim{position:fixed;inset:0;background:rgba(0,0,0,.48);z-index:15}.shell.menu-open .scrim{display:block}.main{margin-left:0}.menu-toggle{display:inline-flex}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.two{grid-template-columns:1fr}.top{padding:0 16px}.content{padding:18px}.hero{flex-direction:column;padding:32px}.hero h1{font-size:48px}}@media(max-width:560px){.grid,.form-grid,.device-form{grid-template-columns:1fr}.search{display:none}.hero h1{font-size:40px}.user .muted{display:none}}
   </style>
 </head>
 <body>
@@ -1041,7 +912,8 @@ const dashboardHTML = `<!doctype html>
       <nav class="nav">
         <p>主菜单</p>
         <button class="active" type="button" data-view-target="overview">▣ 概览</button>
-        <button type="button" data-view-target="spaces">▤ 目录与 Space</button>
+        <button type="button" data-view-target="spaces">▤ Space 与设备</button>
+        <button type="button" data-view-target="trash">♲ 云端回收站</button>
         <button type="button" data-view-target="records">◴ 同步记录</button>
         {{if .Account.IsAdmin}}<button type="button" data-view-target="accounts">◎ 账号管理</button>{{end}}
         <button type="button" data-view-target="settings">⚙ 同步设置</button>
@@ -1052,7 +924,7 @@ const dashboardHTML = `<!doctype html>
     <div class="scrim" data-menu-close></div>
     <div class="main">
       <header class="top">
-        <div class="top-left"><button class="secondary menu-toggle" type="button" data-menu-toggle aria-label="打开菜单">☰</button><div class="search">⌕ <input placeholder="搜索账号、客户端目录或 Space ID"></div></div>
+        <div class="top-left"><button class="secondary menu-toggle" type="button" data-menu-toggle aria-label="打开菜单">☰</button><div class="search">⌕ <input placeholder="搜索账号、客户端或 Space ID"></div></div>
         <div class="user"><span class="muted">{{.Account.DisplayName}} / {{.Account.Username}}{{if .Account.IsAdmin}} / 管理员{{end}}</span><div class="avatar">{{printf "%.1s" .Account.Username}}</div></div>
       </header>
       <main class="content">
@@ -1061,10 +933,10 @@ const dashboardHTML = `<!doctype html>
           <div class="hero">
             <div>
               <h1>同步控制台</h1>
-              <p class="muted">客户端会上报本地目录到网关。只有在这里选择并分配到 Space 后，同账号同 Space 的目录才会互相同步。</p>
+              <p class="muted">客户端只同步本机 xcloud 保存根目录下对应 Space 的文件。新增、编辑、删除都会同步到同账号同 Space 的所有客户端。</p>
             </div>
             <div class="overview-actions">
-              <button type="button" class="secondary" data-view-target="spaces">查看客户端目录</button>
+              <button type="button" class="secondary" data-view-target="spaces">查看 Space 与设备</button>
               <form method="post" action="/admin/accounts/reset-token">
                 <input type="hidden" name="account_id" value="{{.Account.ID}}">
                 <button type="submit">重置我的同步 token</button>
@@ -1074,14 +946,14 @@ const dashboardHTML = `<!doctype html>
           <div class="grid">
             <div class="stat"><div class="label">账号数</div><strong>{{.TotalAccounts}}</strong><div class="hint">当前可管理范围</div></div>
             <div class="stat"><div class="label">Space</div><strong>{{.TotalSpaces}}</strong><div class="hint">{{.ActiveSpaces}} 个启用中</div></div>
-            <div class="stat"><div class="label">有效文件</div><strong>{{.TotalFiles}}</strong><div class="hint">不含删除 tombstone</div></div>
-            <div class="stat"><div class="label">删除记录</div><strong>{{.TotalDeleted}}</strong><div class="hint">可用于后续恢复能力</div></div>
+            <div class="stat"><div class="label">有效文件</div><strong>{{.TotalFiles}}</strong><div class="hint">当前云端有效版本</div></div>
+            <div class="stat"><div class="label">回收站</div><strong>{{.TotalDeleted}}</strong><div class="hint">删除文件保留 10 天</div></div>
           </div>
           <section class="panel" style="margin-top:18px">
             <h2>客户端命令</h2>
-            <p class="muted">客户端首次启动无需 token。打开本机客户端页面登录云端账号并开启同步后，客户端会上报根级目录，网关选择目录前不会上传或下载文件。</p>
+            <p class="muted">客户端首次启动无需 token。打开本机客户端页面登录云端账号并开启同步后，只要文件放在 xcloud 目录下就会参与同步。</p>
             <div class="cmd">mkdir -p ./xcloud && ./xcloud client -server http://127.0.0.1:8080</div>
-            <p class="muted">默认保存根目录是客户端进程启动目录下的 xcloud，可在“客户端保存目录”里按设备修改。</p>
+            <p class="muted">默认保存根目录是客户端进程启动目录下的 xcloud。默认 Space 对应 xcloud/default；其他 Space 对应 xcloud/&lt;space-id&gt;。</p>
           </section>
         </section>
 
@@ -1092,98 +964,38 @@ const dashboardHTML = `<!doctype html>
             <section class="panel">
               <div class="section-head">
                 <div>
-                  <h2>{{.Account.Username}} 的客户端目录</h2>
-                  <p class="muted">客户端上报的本地目录会先进入待选择状态。选择到某个 Space 后，同账号同 Space 的目录开始互相同步。</p>
+                  <h2>{{.Account.Username}} 的 Space</h2>
+                  <p class="muted">Space 仍然保留，用来隔离不同项目。每个客户端只同步 xcloud 目录下对应 Space 的子目录。</p>
                 </div>
               </div>
-              {{if .HasDuplicateNames}}
-              <div class="duplicate-alert">检测到客户端名称重复：{{range .DuplicateNames}}<code>{{.}}</code> {{end}}。建议启动客户端时使用 <code>-device</code> 指定唯一名称，或调整主机名/客户端配置后重新登录。</div>
-              {{end}}
-              <div class="device-filter">
-                <div>
-                  <label>当前客户端</label>
-                  <select data-device-select>
-                    {{range .Devices}}<option value="{{.DeviceID}}">{{if .Hostname}}{{.Hostname}} / {{end}}{{.DeviceID}}</option>{{end}}
-                  </select>
-                </div>
-                <span class="muted mini">默认展示第一个客户端；切换后只显示该客户端上报的目录。</span>
-              </div>
-              <div class="folder-list">
-                {{range .Folders}}
-                {{$currentSpace := .Folder.SpaceID}}
-                <div class="folder-node {{if not .HasParent}}root{{end}} {{if eq .Folder.Status "selected"}}selected{{end}} {{if eq .Folder.Status "disabled"}}disabled{{end}} {{if .HasLoading}}loading{{end}}" data-folder-id="{{.Folder.ID}}" data-device-id="{{.Folder.DeviceID}}" data-parent-path="{{.Folder.ParentPath}}" data-root-path="{{.Folder.RootPath}}" data-depth="{{.Folder.Depth}}" style="--indent:{{.Indent}}px">
-                  <div class="folder-row">
-                    <div class="folder-left">
-                      <span class="tree-indent"></span>
-                      <span class="branch"></span>
-                      <span class="folder-icon">{{if .HasLoading}}…{{else}}▤{{end}}</span>
-                      <div class="folder-copy">
-                        <div class="folder-title"><strong>{{.Base}}</strong>{{if eq .Folder.Status "selected"}}<span class="badge ok">已选择</span>{{else if eq .Folder.Status "disabled"}}<span class="badge off">已停用</span>{{else}}<span class="badge">待选择</span>{{end}}{{if .HasLoading}}<span class="badge warn">加载中</span>{{else if .Folder.ChildrenReported}}<span class="badge ok">已展开</span>{{end}}</div>
-                        <div class="folder-path"><code>{{.Folder.RootPath}}</code></div>
-                        <div class="mini">设备 {{.Folder.DeviceID}} · 层级 {{.Folder.Depth}}{{if .Folder.SpaceID}} · Space {{.Folder.SpaceID}}{{else}} · 未分配 Space{{end}}{{if .Folder.ParentPath}} · 上级 {{.Folder.ParentPath}}{{end}}</div>
-                      </div>
-                    </div>
-                    <div class="folder-actions">
-                      {{if .Folder.ChildrenReported}}
-                      <button class="secondary" type="button" data-tree-toggle>折叠</button>
-                      {{else}}
-                      <form class="inline" method="post" action="/admin/folders/expand">
-                        <input type="hidden" name="account_id" value="{{.Folder.AccountID}}">
-                        <input type="hidden" name="folder_id" value="{{.Folder.ID}}">
-                        <button class="secondary" type="submit">展开</button>
+              <table>
+                <thead><tr><th>名称</th><th>ID</th><th>本地路径</th><th>文件</th><th>回收站</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody>
+                  {{range .Spaces}}
+                  <tr>
+                    <td>{{.Space.Name}}</td>
+                    <td><code>{{.Space.ID}}</code></td>
+                    <td><code>xcloud/{{.Space.ID}}</code></td>
+                    <td>{{.FileCount}}</td>
+                    <td>{{.Trash}}</td>
+                    <td>{{if .Space.Active}}<span class="badge ok">启用</span>{{else}}<span class="badge off">停用</span>{{end}}</td>
+                    <td>
+                      <form class="inline" method="post" action="/admin/spaces/toggle">
+                        <input type="hidden" name="account_id" value="{{.Space.AccountID}}">
+                        <input type="hidden" name="space_id" value="{{.Space.ID}}">
+                        {{if .Space.Active}}
+                        <input type="hidden" name="active" value="false"><button class="secondary" type="submit">停用</button>
+                        {{else}}
+                        <input type="hidden" name="active" value="true"><button type="submit">启用</button>
+                        {{end}}
                       </form>
-                      {{end}}
-                      <form class="inline select-form" method="post" action="/admin/folders/select">
-                        <input type="hidden" name="account_id" value="{{.Folder.AccountID}}">
-                        <input type="hidden" name="folder_id" value="{{.Folder.ID}}">
-                        <select class="small-select" name="space_id">
-                          {{range .Spaces}}<option value="{{.Space.ID}}" {{if eq .Space.ID $currentSpace}}selected{{end}}>{{.Space.Name}}</option>{{end}}
-                        </select>
-                        <button type="submit">选择同步</button>
-                      </form>
-                      <form class="inline" method="post" action="/admin/folders/disable">
-                        <input type="hidden" name="account_id" value="{{.Folder.AccountID}}">
-                        <input type="hidden" name="folder_id" value="{{.Folder.ID}}">
-                        <button class="secondary" type="submit">停用</button>
-                      </form>
-                    </div>
-                  </div>
-                  {{if .HasLoading}}<div class="loading-row" style="padding-left:calc({{.Indent}}px + 50px)"><span class="spinner"></span><span>已通知客户端上报下一级目录，等待客户端下一轮心跳...</span></div>{{end}}
-                </div>
-                {{else}}
-                <div class="empty-tree"><span class="muted">暂无客户端目录上报。启动客户端后会先上报根级目录，点击目录行后再逐级加载下一级。</span></div>
-                {{end}}
-              </div>
-            </section>
-            {{end}}
-            </div>
-            <aside>
-            {{range .Groups}}
-            <section class="panel">
-              <h2>{{.Account.Username}} 的客户端保存目录</h2>
-              <p class="muted">这里配置的是设备级全局保存根目录，不是单个同步目录。每个已选择同步的目录会在该根目录下按 Space 和目录哈希生成独立子目录。</p>
-              <div class="device-list">
-                {{range .Devices}}
-                <div class="device-card">
-                  <div class="device-head">
-                    <div class="device-title"><strong>{{.DeviceID}}</strong><span class="mini">{{if .Hostname}}{{.Hostname}}{{else}}未上报主机名{{end}}</span></div>
-                    <span class="badge">{{if .LastSeenAt}}{{formatTime .LastSeenAt}}{{else}}未心跳{{end}}</span>
-                  </div>
-                  <form class="device-form" method="post" action="/admin/clients/storage-root">
-                    <input type="hidden" name="account_id" value="{{.AccountID}}">
-                    <input type="hidden" name="device_id" value="{{.DeviceID}}">
-                    <div>
-                      <label>保存根目录</label>
-                      <input name="storage_root" value="{{.StorageRoot}}" placeholder="/absolute/path/to/xcloud" required>
-                    </div>
-                    <button class="secondary" type="submit">保存</button>
-                  </form>
-                  <div class="device-meta">客户端会自动创建该目录；路径必须是客户端所在机器上的绝对路径。</div>
-                </div>
-                {{else}}
-                <div class="empty-tree"><span class="muted">暂无已登录客户端。客户端登录云端账号后会出现在这里。</span></div>
-                {{end}}
-              </div>
+                    </td>
+                  </tr>
+                  {{else}}
+                  <tr><td colspan="7"><span class="muted">暂无 Space。</span></td></tr>
+                  {{end}}
+                </tbody>
+              </table>
             </section>
             {{end}}
             <section class="panel">
@@ -1200,37 +1012,79 @@ const dashboardHTML = `<!doctype html>
                 <button type="submit">创建 Space</button>
               </form>
             </section>
+            </div>
+            <aside>
             {{range .Groups}}
             <section class="panel">
-              <h2>{{.Account.Username}} 的 Space</h2>
-              <table>
-                <thead><tr><th>名称</th><th>ID</th><th>目录</th><th>状态</th><th>操作</th></tr></thead>
-                <tbody>
-                  {{range .Spaces}}
-                  <tr>
-                    <td>{{.Space.Name}}</td>
-                    <td><code>{{.Space.ID}}</code></td>
-                    <td>{{.Folders}}</td>
-                    <td>{{if .Space.Active}}<span class="badge ok">启用</span>{{else}}<span class="badge off">停用</span>{{end}}</td>
-                    <td>
-                      <form class="inline" method="post" action="/admin/spaces/toggle">
-                        <input type="hidden" name="account_id" value="{{.Space.AccountID}}">
-                        <input type="hidden" name="space_id" value="{{.Space.ID}}">
-                        {{if .Space.Active}}
-                        <input type="hidden" name="active" value="false"><button class="secondary" type="submit">停用</button>
-                        {{else}}
-                        <input type="hidden" name="active" value="true"><button type="submit">启用</button>
-                        {{end}}
-                      </form>
-                    </td>
-                  </tr>
-                  {{end}}
-                </tbody>
-              </table>
+              <h2>{{.Account.Username}} 的客户端</h2>
+              <p class="muted">这里配置的是设备级全局 xcloud 根目录。该目录下的每个 Space 子目录会保持一致。</p>
+              {{if .HasDuplicateNames}}
+              <div class="duplicate-alert">检测到客户端名称重复：{{range .DuplicateNames}}<code>{{.}}</code> {{end}}。建议启动客户端时使用 <code>-device</code> 指定唯一名称。</div>
+              {{end}}
+              <div class="device-list">
+                {{range .Devices}}
+                <div class="device-card">
+                  <div class="device-head">
+                    <div class="device-title"><strong>{{.DeviceID}}</strong><span class="mini">{{if .Hostname}}{{.Hostname}}{{else}}未上报主机名{{end}}</span></div>
+                    <span class="badge">{{if .LastSeenAt}}{{formatTime .LastSeenAt}}{{else}}未心跳{{end}}</span>
+                  </div>
+                  <form class="device-form" method="post" action="/admin/clients/storage-root">
+                    <input type="hidden" name="account_id" value="{{.AccountID}}">
+                    <input type="hidden" name="device_id" value="{{.DeviceID}}">
+                    <div>
+                      <label>保存根目录</label>
+                      <input name="storage_root" value="{{.StorageRoot}}" placeholder="/absolute/path/to/xcloud" required>
+                    </div>
+                    <button class="secondary" type="submit">保存</button>
+                  </form>
+                  <div class="device-meta">客户端会自动创建该目录；路径必须是客户端所在机器上的绝对路径。同步内容只来自该目录下的 Space 子目录。</div>
+                </div>
+                {{else}}
+                <div class="empty-tree"><span class="muted">暂无已登录客户端。客户端登录云端账号后会出现在这里。</span></div>
+                {{end}}
+              </div>
             </section>
             {{end}}
             </aside>
           </div>
+        </section>
+
+        <section class="view" data-view="trash">
+          {{range .Groups}}
+          <section class="panel">
+            <div class="section-head">
+              <div>
+                <h2>{{.Account.Username}} 的云端回收站</h2>
+                <p class="muted">删除文件会在云端临时保留 10 天。恢复后会产生新的文件版本，并同步恢复到所有客户端。</p>
+              </div>
+            </div>
+            <div class="record-list">
+              {{range .Trash}}
+              <div class="record-row">
+                <div class="record-main">
+                  <div class="record-title">
+                    <strong>{{.Path}}</strong>
+                    <span class="badge">{{.SpaceID}}</span>
+                    <span class="badge off">已删除</span>
+                  </div>
+                  <div class="record-path">删除时间 {{formatTime .DeletedAt}} · 过期时间 {{formatTime .ExpiresAt}} · 大小 {{.Size}} bytes</div>
+                </div>
+                <div class="record-side">
+                  <form method="post" action="/admin/trash/restore">
+                    <input type="hidden" name="account_id" value="{{.AccountID}}">
+                    <input type="hidden" name="space_id" value="{{.SpaceID}}">
+                    <input type="hidden" name="file_id" value="{{.FileID}}">
+                    <input type="hidden" name="path" value="{{.Path}}">
+                    <button type="submit">恢复</button>
+                  </form>
+                </div>
+              </div>
+              {{else}}
+              <div class="empty-tree"><span class="muted">回收站为空。</span></div>
+              {{end}}
+            </div>
+          </section>
+          {{end}}
         </section>
 
         <section class="view" data-view="records">
@@ -1387,38 +1241,6 @@ const dashboardHTML = `<!doctype html>
       if (menuToggle) menuToggle.addEventListener("click", function(){ shell.classList.toggle("menu-open"); });
       if (menuClose) menuClose.addEventListener("click", closeMenu);
       buttons.forEach(function(button){ button.addEventListener("click", function(){ show(button.getAttribute("data-view-target")); }); });
-      var nodes = Array.prototype.slice.call(document.querySelectorAll(".folder-node"));
-      function applyDeviceFilter(select){
-        var panel = select.closest(".panel");
-        var selected = select.value;
-        Array.prototype.slice.call(panel.querySelectorAll(".folder-node")).forEach(function(node){
-          node.classList.toggle("device-hidden", selected && node.getAttribute("data-device-id") !== selected);
-        });
-      }
-      document.querySelectorAll("[data-device-select]").forEach(function(select){
-        select.addEventListener("change", function(){ applyDeviceFilter(select); });
-        applyDeviceFilter(select);
-      });
-      function childNodes(parent){
-        return nodes.filter(function(node){
-          return node.getAttribute("data-device-id") === parent.getAttribute("data-device-id") &&
-            node.getAttribute("data-parent-path") === parent.getAttribute("data-root-path");
-        });
-      }
-      function setChildren(parent, hidden){
-        childNodes(parent).forEach(function(child){
-          child.classList.toggle("collapsed-child", hidden);
-          if (hidden) setChildren(child, true);
-        });
-      }
-      document.querySelectorAll("[data-tree-toggle]").forEach(function(button){
-        button.addEventListener("click", function(){
-          var node = button.closest(".folder-node");
-          var hidden = button.textContent === "折叠";
-          setChildren(node, hidden);
-          button.textContent = hidden ? "展开" : "折叠";
-        });
-      });
       var initial = (location.hash || "#{{.InitialView}}").slice(1);
       if (!document.querySelector('[data-view="' + initial + '"]')) initial = "overview";
       show(initial);

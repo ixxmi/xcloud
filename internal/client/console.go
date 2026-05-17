@@ -81,7 +81,7 @@ func NewConsole(cfg ConsoleConfig) (*Console, error) {
 	if effectiveDeviceID == "" {
 		effectiveDeviceID = local.DeviceID
 	}
-	cfg.DeviceID = defaultDeviceID(effectiveDeviceID, defaultDiscoveryRoot(cfg.Root), local.StorageRoot, local.ServerURL)
+	cfg.DeviceID = defaultDeviceID(effectiveDeviceID, local.StorageRoot, local.ServerURL)
 	local.DeviceID = cfg.DeviceID
 	local.SyncSettings = syncmodel.NormalizeSyncSettings(local.SyncSettings)
 	local.DeleteRemote = local.DeleteRemote || cfg.DeleteRemote
@@ -367,23 +367,12 @@ func (c *Console) startSyncLocked() {
 		DeleteRemote: c.local.DeleteRemote,
 		Log:          c.log,
 	}
-	if c.cfg.Root != "" {
-		cfg.Root = c.cfg.Root
-	}
 	go func() {
 		var err error
-		if cfg.Root != "" {
-			var engine *Engine
-			engine, err = NewEngine(cfg)
-			if err == nil {
-				err = engine.Run(ctx)
-			}
-		} else {
-			var supervisor *Supervisor
-			supervisor, err = NewSupervisor(cfg)
-			if err == nil {
-				err = supervisor.Run(ctx)
-			}
+		var supervisor *Supervisor
+		supervisor, err = NewSupervisor(cfg)
+		if err == nil {
+			err = supervisor.Run(ctx)
 		}
 		if err != nil && !errors.Is(err, context.Canceled) {
 			c.setSyncStopped(err)
@@ -433,7 +422,6 @@ func (c *Console) viewDataLocked(message string) clientConsoleData {
 		DeviceID:     c.local.DeviceID,
 		SpaceID:      c.local.SpaceID,
 		ConfigPath:   c.cfg.ConfigPath,
-		Root:         c.cfg.Root,
 		StorageRoot:  c.local.StorageRoot,
 		LastStarted:  c.lastStarted,
 		LastError:    c.lastError,
@@ -453,7 +441,6 @@ type clientConsoleData struct {
 	DeviceID     string
 	SpaceID      string
 	ConfigPath   string
-	Root         string
 	StorageRoot  string
 	LastStarted  string
 	LastError    string
@@ -463,20 +450,6 @@ type clientConsoleData struct {
 }
 
 func defaultStorageRoot(root string) string {
-	if strings.TrimSpace(root) != "" {
-		if abs, err := filepath.Abs(root); err == nil {
-			return abs
-		}
-		return root
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "xcloud"
-	}
-	return filepath.Join(cwd, "xcloud")
-}
-
-func defaultDiscoveryRoot(root string) string {
 	if strings.TrimSpace(root) != "" {
 		if abs, err := filepath.Abs(root); err == nil {
 			return abs
@@ -513,19 +486,19 @@ const clientConsoleHTML = `<!doctype html>
       <div class="brand"><div class="logo">X</div><span>xcloud 客户端</span></div>
       <div class="copy">
         <h1>登录云端账号后开启同步</h1>
-        <p>首次启动不需要手工复制 token。客户端会保存本机凭证，开启同步后上报本地目录，等待云端管理页选择目录和 Space。</p>
+        <p>首次启动不需要手工复制 token。客户端会保存本机凭证；开启同步后，xcloud 目录下的所有 Space 文件会和同账号设备保持一致。</p>
       </div>
       <div class="steps">
         <div class="step"><b>1</b><span>登录云端账号</span></div>
         <div class="step"><b>2</b><span>点击开启同步</span></div>
-        <div class="step"><b>3</b><span>在云端选择目录</span></div>
+        <div class="step"><b>3</b><span>把文件放入 xcloud</span></div>
       </div>
     </section>
     <section class="panel">
       <div class="card">
         {{if .LoggedIn}}
         <h2>客户端已绑定</h2>
-        <p class="muted">当前客户端会以该账号上报目录并执行同步。</p>
+        <p class="muted">当前客户端只同步保存根目录下的 Space 子目录。默认 Space 路径是 xcloud/default。</p>
         {{else}}
         <h2>绑定云端账号</h2>
         <p class="muted">输入云端管理后台账号，客户端会换取本机专用同步凭证。</p>
@@ -540,7 +513,7 @@ const clientConsoleHTML = `<!doctype html>
             <div class="row"><span>设备</span><span>{{.DeviceID}}</span></div>
             <div class="row"><span>Space</span><span>{{.SpaceID}}</span></div>
             <div class="row"><span>保存根目录</span><span>{{.StorageRoot}}</span></div>
-            <div class="row"><span>模式</span><span>{{if .Root}}指定目录：{{.Root}}{{else}}目录发现{{end}}</span></div>
+            <div class="row"><span>同步范围</span><span>{{.StorageRoot}}/&lt;space-id&gt;</span></div>
             <div class="row"><span>配置</span><span>{{.ConfigPath}}</span></div>
             {{if .LastStarted}}<div class="row"><span>启动时间</span><span>{{.LastStarted}}</span></div>{{end}}
             {{if .LastError}}<div class="row"><span>错误</span><span>{{.LastError}}</span></div>{{end}}

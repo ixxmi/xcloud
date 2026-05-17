@@ -3,8 +3,6 @@ package client
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -54,6 +52,8 @@ type Supervisor struct {
 	state         *State
 	engines       map[string]*Engine
 	engineStarted map[string]bool
+	engineCancels map[string]context.CancelFunc
+	activeSpaces  []string
 	log           *slog.Logger
 	mu            sync.Mutex
 }
@@ -73,9 +73,6 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if cfg.ServerURL == "" {
 		return nil, errors.New("server URL is required")
 	}
-	if cfg.Root == "" {
-		return nil, errors.New("root is required for single-folder sync")
-	}
 	if cfg.SpaceID == "" {
 		cfg.SpaceID = "default"
 	}
@@ -89,36 +86,40 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	rootAbs, err := filepath.Abs(cfg.Root)
-	if err != nil {
-		return nil, err
-	}
-	cfg.Root = rootAbs
-	if cfg.LocalRoot == "" && cfg.StorageRoot == "" {
-		cfg.LocalRoot = cfg.Root
-		cfg.StorageRoot = cfg.Root
-	} else if cfg.StorageRoot == "" {
-		cfg.StorageRoot = cfg.LocalRoot
+	if cfg.StorageRoot == "" {
+		if cfg.Root != "" {
+			cfg.StorageRoot = cfg.Root
+		} else {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return nil, err
+			}
+			cfg.StorageRoot = filepath.Join(cwd, "xcloud")
+		}
 	}
 	storageRootAbs, err := filepath.Abs(cfg.StorageRoot)
 	if err != nil {
 		return nil, err
 	}
 	cfg.StorageRoot = storageRootAbs
-	if cfg.LocalRoot == "" {
-		cfg.LocalRoot = localRootFor(cfg.StorageRoot, cfg.Root, cfg.SpaceID)
+	if err := os.MkdirAll(cfg.StorageRoot, 0o755); err != nil {
+		return nil, err
 	}
-	cfg.DeviceID = defaultDeviceID(cfg.DeviceID, cfg.Root, cfg.StorageRoot, cfg.ServerURL)
+	if cfg.LocalRoot == "" {
+		cfg.LocalRoot = filepath.Join(cfg.StorageRoot, safeStateName(cfg.SpaceID))
+	}
 	localRootAbs, err := filepath.Abs(cfg.LocalRoot)
 	if err != nil {
 		return nil, err
 	}
 	cfg.LocalRoot = localRootAbs
+	cfg.Root = cfg.LocalRoot
+	cfg.DeviceID = defaultDeviceID(cfg.DeviceID, cfg.StorageRoot, cfg.ServerURL)
 	if err := os.MkdirAll(cfg.LocalRoot, 0o755); err != nil {
 		return nil, err
 	}
 	if cfg.StatePath == "" {
-		cfg.StatePath = filepath.Join(cfg.LocalRoot, ".xcloud", "state.json")
+		cfg.StatePath = filepath.Join(cfg.LocalRoot, ".xcloud", "state-"+safeStateName(cfg.SpaceID)+".json")
 	}
 	state, err := OpenState(cfg.StatePath)
 	if err != nil {
@@ -133,6 +134,17 @@ func NewEngine(cfg Config) (*Engine, error) {
 		state: state,
 		log:   cfg.Log,
 	}, nil
+}
+
+func defaultStorageRootPath(root string) (string, error) {
+	if strings.TrimSpace(root) != "" {
+		return filepath.Abs(root)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return filepath.Abs("xcloud")
+	}
+	return filepath.Join(cwd, "xcloud"), nil
 }
 
 func NewSupervisor(cfg Config) (*Supervisor, error) {
@@ -152,30 +164,16 @@ func NewSupervisor(cfg Config) (*Supervisor, error) {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	if cfg.Root == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return nil, err
-		}
-		cfg.Root = filepath.Join(cwd, "xcloud")
-	}
-	rootAbs, err := filepath.Abs(cfg.Root)
+	storageRoot, err := defaultStorageRootPath(firstNonEmpty(cfg.StorageRoot, cfg.Root))
 	if err != nil {
 		return nil, err
 	}
-	cfg.Root = rootAbs
-	if cfg.StorageRoot == "" {
-		cfg.StorageRoot = cfg.Root
-	}
-	storageRootAbs, err := filepath.Abs(cfg.StorageRoot)
-	if err != nil {
-		return nil, err
-	}
-	cfg.StorageRoot = storageRootAbs
+	cfg.StorageRoot = storageRoot
 	if err := os.MkdirAll(cfg.StorageRoot, 0o755); err != nil {
 		return nil, err
 	}
-	cfg.DeviceID = defaultDeviceID(cfg.DeviceID, cfg.Root, cfg.StorageRoot, cfg.ServerURL)
+	cfg.Root = filepath.Join(cfg.StorageRoot, safeStateName(cfg.SpaceID))
+	cfg.DeviceID = defaultDeviceID(cfg.DeviceID, cfg.StorageRoot, cfg.ServerURL)
 	if cfg.StatePath == "" {
 		cfg.StatePath = filepath.Join(clientStateRoot(), ".xcloud", "discovery-state.json")
 	}
@@ -189,6 +187,7 @@ func NewSupervisor(cfg Config) (*Supervisor, error) {
 		state:         state,
 		engines:       map[string]*Engine{},
 		engineStarted: map[string]bool{},
+		engineCancels: map[string]context.CancelFunc{},
 		log:           cfg.Log,
 	}, nil
 }
@@ -234,78 +233,21 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	enabled, err := s.accountSyncEnabled()
+	status, err := s.refreshStatus()
 	if err != nil {
 		s.reportRecord(syncmodel.SyncActionScan, syncmodel.SyncRecordStatusFailed, "", err, 0)
 		return err
 	}
-	if !enabled {
+	if !status.SyncEnabled {
 		s.log.Info("account sync disabled; waiting for enable")
+		s.stopInactiveEngines(nil)
 		return nil
 	}
-	candidates := []string{s.cfg.Root}
-	host, _ := os.Hostname()
-	status, err := s.api.FolderStatus()
-	if err != nil {
-		s.reportRecord(syncmodel.SyncActionScan, syncmodel.SyncRecordStatusFailed, "", err, 0)
-		return err
-	}
-	applySettingsToConfig(&s.cfg, status.Settings)
-	if err := s.applyStorageRoot(status.StorageRoot); err != nil {
-		return err
-	}
-	candidates[0] = s.cfg.Root
-	for _, req := range status.Requests {
-		if err := s.reportChildren(host, req); err != nil {
-			return err
-		}
-	}
-	for _, folder := range status.Selected {
-		if !containsString(candidates, folder.RootPath) {
-			candidates = append(candidates, folder.RootPath)
-		}
-	}
-	sort.Strings(candidates)
-	selected := 0
-	for _, root := range candidates {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		reportKey := s.reportedDirKey(root)
-		if s.state.DirReported(reportKey) {
-			continue
-		}
-		resp, err := s.api.ReportFolder(syncmodel.FolderReportRequest{
-			DeviceID:         s.cfg.DeviceID,
-			Hostname:         host,
-			RootPath:         root,
-			StorageRoot:      s.cfg.StorageRoot,
-			Depth:            0,
-			SuggestedSpaceID: s.cfg.SpaceID,
-		})
-		if err != nil {
-			return err
-		}
-		if err := s.state.MarkDirReported(reportKey); err != nil {
-			return err
-		}
-		if !resp.Selected || resp.Space == nil {
-			s.log.Info("client folder reported; waiting for gateway selection",
-				"device", s.cfg.DeviceID,
-				"root", root,
-				"suggested_space", s.cfg.SpaceID,
-				"status", resp.Folder.Status,
-			)
-			continue
-		}
-	}
-	status, err = s.api.FolderStatus()
-	if err != nil {
-		return err
-	}
-	for _, folder := range status.Selected {
-		selected++
-		engine, err := s.engineFor(folder.RootPath, folder.SpaceID)
+	spaces := activeSpaceIDs(status.Spaces, s.cfg.SpaceID)
+	s.setActiveSpaces(spaces)
+	s.stopInactiveEngines(spaces)
+	for _, spaceID := range spaces {
+		engine, err := s.engineFor(spaceID)
 		if err != nil {
 			return err
 		}
@@ -315,26 +257,27 @@ func (s *Supervisor) SyncOnce(ctx context.Context) error {
 			}
 			continue
 		}
-		s.startEngine(ctx, folder.RootPath, folder.SpaceID, engine)
-	}
-	if len(candidates) == 0 {
-		s.log.Info("no local folders discovered for reporting")
-	} else if selected == 0 {
-		s.log.Info("no selected folders yet; waiting for gateway selection", "candidates", len(candidates))
+		s.startEngine(ctx, spaceID, engine)
 	}
 	return nil
 }
 
-func (s *Supervisor) accountSyncEnabled() (bool, error) {
+func (s *Supervisor) refreshStatus() (syncmodel.ClientStatusResponse, error) {
 	status, err := s.api.ClientStatus()
 	if err != nil {
-		return false, err
+		return syncmodel.ClientStatusResponse{}, err
 	}
 	applySettingsToConfig(&s.cfg, status.Settings)
 	if err := s.applyStorageRoot(status.StorageRoot); err != nil {
-		return false, err
+		return syncmodel.ClientStatusResponse{}, err
 	}
-	return status.SyncEnabled, nil
+	return status, nil
+}
+
+func (s *Supervisor) setActiveSpaces(spaces []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activeSpaces = append([]string(nil), spaces...)
 }
 
 func (s *Supervisor) applyStorageRoot(storageRoot string) error {
@@ -356,55 +299,14 @@ func (s *Supervisor) applyStorageRoot(storageRoot string) error {
 	return nil
 }
 
-func (s *Supervisor) reportChildren(host string, req syncmodel.FolderDiscoveryRequest) error {
-	children, err := discoverChildFolders(req.RootPath)
-	if err != nil {
-		s.log.Warn("cannot discover child folders", "root", req.RootPath, "err", err)
-		return s.api.ChildrenComplete(syncmodel.FolderChildrenCompleteRequest{
-			DeviceID: s.cfg.DeviceID,
-			RootPath: req.RootPath,
-		})
-	}
-	for _, child := range children {
-		reportKey := s.reportedDirKey(child)
-		if s.state.DirReported(reportKey) {
-			continue
-		}
-		if _, err := s.api.ReportFolder(syncmodel.FolderReportRequest{
-			DeviceID:         s.cfg.DeviceID,
-			Hostname:         host,
-			RootPath:         child,
-			StorageRoot:      s.cfg.StorageRoot,
-			ParentPath:       req.RootPath,
-			Depth:            req.Depth,
-			SuggestedSpaceID: s.cfg.SpaceID,
-		}); err != nil {
-			return err
-		}
-		if err := s.state.MarkDirReported(reportKey); err != nil {
-			return err
-		}
-		s.log.Info("reported child folder", "parent", req.RootPath, "root", child)
-	}
-	return s.api.ChildrenComplete(syncmodel.FolderChildrenCompleteRequest{
-		DeviceID: s.cfg.DeviceID,
-		RootPath: req.RootPath,
-	})
-}
-
-func (s *Supervisor) reportedDirKey(path string) string {
-	sum := sha256.Sum256([]byte(s.cfg.Token))
-	tokenPrefix := hex.EncodeToString(sum[:])[:12]
-	return s.cfg.ServerURL + "\x00" + s.cfg.DeviceID + "\x00" + tokenPrefix + "\x00" + path
-}
-
-func (s *Supervisor) engineFor(root, spaceID string) (*Engine, error) {
-	key := root + "\x00" + spaceID
-	localRoot := localRootFor(s.cfg.StorageRoot, root, spaceID)
+func (s *Supervisor) engineFor(spaceID string) (*Engine, error) {
+	key := spaceID
+	localRoot := filepath.Join(s.cfg.StorageRoot, safeStateName(spaceID))
 	s.mu.Lock()
 	if engine := s.engines[key]; engine != nil {
 		if engine.cfg.LocalRoot != localRoot {
 			engine.cfg.StorageRoot = s.cfg.StorageRoot
+			engine.cfg.Root = localRoot
 			if err := engine.switchRoot(localRoot); err != nil {
 				s.mu.Unlock()
 				return nil, err
@@ -415,8 +317,8 @@ func (s *Supervisor) engineFor(root, spaceID string) (*Engine, error) {
 	}
 	s.mu.Unlock()
 	cfg := s.cfg
-	cfg.Root = root
 	cfg.LocalRoot = localRoot
+	cfg.Root = localRoot
 	cfg.SpaceID = spaceID
 	cfg.StatePath = filepath.Join(cfg.LocalRoot, ".xcloud", "state-"+safeStateName(spaceID)+".json")
 	engine, err := NewEngine(cfg)
@@ -429,24 +331,47 @@ func (s *Supervisor) engineFor(root, spaceID string) (*Engine, error) {
 	return engine, nil
 }
 
-func (s *Supervisor) startEngine(ctx context.Context, root, spaceID string, engine *Engine) {
-	key := root + "\x00" + spaceID
+func (s *Supervisor) startEngine(ctx context.Context, spaceID string, engine *Engine) {
+	key := spaceID
 	s.mu.Lock()
 	if s.engineStarted[key] {
 		s.mu.Unlock()
 		return
 	}
+	engineCtx, cancel := context.WithCancel(ctx)
 	s.engineStarted[key] = true
+	s.engineCancels[key] = cancel
 	s.mu.Unlock()
 	go func() {
-		err := engine.Run(ctx)
+		err := engine.Run(engineCtx)
 		if err != nil && !errors.Is(err, context.Canceled) {
-			s.log.Error("selected folder sync stopped", "root", root, "space", spaceID, "err", err)
+			s.log.Error("space sync stopped", "space", spaceID, "err", err)
 		}
 		s.mu.Lock()
 		delete(s.engineStarted, key)
+		delete(s.engineCancels, key)
 		s.mu.Unlock()
 	}()
+}
+
+func (s *Supervisor) stopInactiveEngines(active []string) {
+	activeSet := map[string]bool{}
+	for _, spaceID := range active {
+		activeSet[spaceID] = true
+	}
+	var cancels []context.CancelFunc
+	s.mu.Lock()
+	for spaceID, cancel := range s.engineCancels {
+		if !activeSet[spaceID] {
+			cancels = append(cancels, cancel)
+			delete(s.engineCancels, spaceID)
+			delete(s.engineStarted, spaceID)
+		}
+	}
+	s.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 }
 
 func (s *Supervisor) reportRecord(action, status, path string, err error, duration time.Duration) {
@@ -537,8 +462,14 @@ func (e *Engine) runRealtimeWatch(ctx context.Context) error {
 			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) != 0 {
 				if info, statErr := os.Stat(event.Name); statErr == nil && info.IsDir() {
 					_ = filepath.WalkDir(event.Name, func(path string, d os.DirEntry, walkErr error) error {
-						if walkErr != nil || !d.IsDir() || shouldSkipDiscoveredDir(d.Name()) {
+						if walkErr != nil || !d.IsDir() {
 							return nil
+						}
+						if rel, relErr := filepath.Rel(e.cfg.LocalRoot, path); relErr == nil {
+							rel = filepath.ToSlash(rel)
+							if rel == ".xcloud" || strings.HasPrefix(rel, ".xcloud/") {
+								return filepath.SkipDir
+							}
 						}
 						_ = watcher.Add(path)
 						return nil
@@ -586,7 +517,7 @@ func (e *Engine) watchTree(watcher *fsnotify.Watcher) error {
 			return relErr
 		}
 		rel = filepath.ToSlash(rel)
-		if rel == ".xcloud" || strings.HasPrefix(rel, ".xcloud/") || shouldSkipDiscoveredDir(d.Name()) {
+		if rel == ".xcloud" || strings.HasPrefix(rel, ".xcloud/") {
 			if path != e.cfg.LocalRoot {
 				return filepath.SkipDir
 			}
@@ -634,7 +565,7 @@ func (e *Engine) accountSyncEnabled() (bool, error) {
 		if storageRootAbs != e.cfg.StorageRoot {
 			e.cfg.StorageRoot = storageRootAbs
 		}
-		targetRoot := localRootFor(e.cfg.StorageRoot, e.cfg.Root, e.cfg.SpaceID)
+		targetRoot := filepath.Join(e.cfg.StorageRoot, safeStateName(e.cfg.SpaceID))
 		if targetRoot != e.cfg.LocalRoot {
 			if err := e.switchRoot(targetRoot); err != nil {
 				return false, err
@@ -653,6 +584,7 @@ func (e *Engine) switchRoot(root string) error {
 		return err
 	}
 	e.cfg.LocalRoot = rootAbs
+	e.cfg.Root = rootAbs
 	e.cfg.StatePath = filepath.Join(rootAbs, ".xcloud", "state-"+safeStateName(e.cfg.SpaceID)+".json")
 	state, err := OpenState(e.cfg.StatePath)
 	if err != nil {
@@ -667,13 +599,6 @@ func (e *Engine) switchRoot(root string) error {
 }
 
 func (e *Engine) syncOnce(ctx context.Context) error {
-	selected, err := e.ensureFolderSelected()
-	if err != nil {
-		return err
-	}
-	if !selected {
-		return nil
-	}
 	if err := e.pullRemote(ctx); err != nil {
 		return err
 	}
@@ -681,38 +606,6 @@ func (e *Engine) syncOnce(ctx context.Context) error {
 		return err
 	}
 	return e.pullRemote(ctx)
-}
-
-func (e *Engine) ensureFolderSelected() (bool, error) {
-	host, _ := os.Hostname()
-	resp, err := e.api.ReportFolder(syncmodel.FolderReportRequest{
-		DeviceID:         e.cfg.DeviceID,
-		Hostname:         host,
-		RootPath:         e.cfg.Root,
-		StorageRoot:      e.cfg.StorageRoot,
-		SuggestedSpaceID: e.cfg.SpaceID,
-	})
-	if err != nil {
-		return false, err
-	}
-	if !resp.Selected || resp.Space == nil {
-		e.log.Info("client folder reported; waiting for gateway selection",
-			"device", e.cfg.DeviceID,
-			"root", e.cfg.Root,
-			"suggested_space", e.cfg.SpaceID,
-			"status", resp.Folder.Status,
-		)
-		return false, nil
-	}
-	if resp.Space.ID != e.cfg.SpaceID {
-		e.log.Info("gateway assigned sync space", "device", e.cfg.DeviceID, "root", e.cfg.Root, "space", resp.Space.ID)
-	}
-	e.cfg.SpaceID = resp.Space.ID
-	e.api.SetSyncContext(resp.Space.ID, e.cfg.DeviceID, e.cfg.Root)
-	if err := e.state.EnsureSpace(resp.Space.ID); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 func (e *Engine) pushLocal(ctx context.Context) error {
@@ -740,9 +633,6 @@ func (e *Engine) pushLocal(ctx context.Context) error {
 		}
 	}
 
-	if !e.cfg.DeleteRemote {
-		return nil
-	}
 	for rel, known := range e.state.Snapshot() {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -934,6 +824,7 @@ func (e *Engine) applyVersion(ctx context.Context, version syncmodel.FileVersion
 			e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
 			return err
 		}
+		cleanupEmptyParents(e.cfg.LocalRoot, filepath.Dir(target))
 		if err := e.state.Set(rel, stateFromVersion(version)); err != nil {
 			e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
 			return err
@@ -1105,31 +996,24 @@ func conflictLocalPath(path, deviceID string) string {
 	return fmt.Sprintf("%s (local conflict from %s at %s)%s", stem, safeDevice, time.Now().Format("20060102-150405"), ext)
 }
 
-func localRootFor(storageRoot, root, spaceID string) string {
-	if storageRoot == "" {
-		storageRoot = root
+func cleanupEmptyParents(root, dir string) {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return
 	}
-	storageRootAbs, storageErr := filepath.Abs(storageRoot)
-	rootAbs, rootErr := filepath.Abs(root)
-	if storageErr == nil && rootErr == nil {
-		if fileutil.PathWithin(storageRootAbs, rootAbs) {
-			return rootAbs
+	for {
+		dirAbs, err := filepath.Abs(dir)
+		if err != nil || dirAbs == rootAbs || !fileutil.PathWithin(rootAbs, dirAbs) {
+			return
 		}
-		storageRoot = storageRootAbs
-		root = rootAbs
+		if err := os.Remove(dirAbs); err != nil {
+			return
+		}
+		dir = filepath.Dir(dirAbs)
 	}
-	if spaceID == "" {
-		spaceID = "default"
-	}
-	sum := sha256.Sum256([]byte(root))
-	base := safeStateName(filepath.Base(root))
-	if base == "" || base == "." || base == string(filepath.Separator) {
-		base = "root"
-	}
-	return filepath.Join(storageRoot, safeStateName(spaceID), hex.EncodeToString(sum[:])[:12]+"-"+base)
 }
 
-func defaultDeviceID(deviceID, root, storageRoot, serverURL string) string {
+func defaultDeviceID(deviceID, storageRoot, serverURL string) string {
 	deviceID = strings.TrimSpace(deviceID)
 	if deviceID != "" {
 		return deviceID
@@ -1138,91 +1022,48 @@ func defaultDeviceID(deviceID, root, storageRoot, serverURL string) string {
 	if host == "" {
 		host = "device"
 	}
-	sum := sha256.Sum256([]byte(serverURL + "\x00" + root + "\x00" + storageRoot))
-	return safeStateName(host) + "-" + hex.EncodeToString(sum[:])[:8]
+	fingerprint := fileutil.HashBytes([]byte(serverURL + "\x00" + storageRoot))
+	return safeStateName(host) + "-" + fingerprint[:8]
 }
 
-func discoverRootFolders() ([]string, error) {
+func activeSpaceIDs(spaces []syncmodel.SyncSpace, fallback string) []string {
 	seen := map[string]bool{}
 	out := []string{}
-	add := func(path string) {
-		if path == "" {
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
 			return
 		}
-		abs, err := filepath.Abs(path)
-		if err != nil {
-			return
+		seen[id] = true
+		out = append(out, id)
+	}
+	for _, space := range spaces {
+		if space.Active {
+			add(space.ID)
 		}
-		info, err := os.Stat(abs)
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return
-		}
-		if seen[abs] || shouldSkipDiscoveredDir(filepath.Base(abs)) {
-			return
-		}
-		seen[abs] = true
-		out = append(out, abs)
 	}
-	if cwd, err := os.Getwd(); err == nil {
-		add(cwd)
+	if len(out) == 0 {
+		add(fallback)
 	}
-	if home, err := os.UserHomeDir(); err == nil {
-		add(home)
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
-func discoverChildFolders(root string) ([]string, error) {
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return nil, err
-	}
-	out := []string{}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if shouldSkipDiscoveredDir(name) {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil || info.Mode()&os.ModeSymlink != 0 {
-			continue
-		}
-		abs, err := filepath.Abs(filepath.Join(root, name))
-		if err != nil {
-			continue
-		}
-		out = append(out, abs)
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
-func shouldSkipDiscoveredDir(name string) bool {
-	if name == "" {
-		return true
-	}
-	if strings.HasPrefix(name, ".") {
-		return true
-	}
-	switch name {
-	case "Applications", "Library", "Movies", "Music", "Public", "go", "node_modules":
-		return true
-	default:
-		return false
-	}
-}
-
-func containsString(values []string, needle string) bool {
-	for _, value := range values {
-		if value == needle {
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i] == "default" {
 			return true
 		}
+		if out[j] == "default" {
+			return false
+		}
+		return out[i] < out[j]
+	})
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
 	}
-	return false
+	return ""
 }
 
 func clientStateRoot() string {
