@@ -136,6 +136,195 @@ func TestDeleteCreatesTrashAndRestoreSyncsToAllClients(t *testing.T) {
 	assertFileContent(t, filepath.Join(engineB.cfg.LocalRoot, "doc.txt"), "keep me")
 }
 
+func TestEmptyDirectoriesSyncAndRemainAfterLastFileDelete(t *testing.T) {
+	t.Parallel()
+
+	store, err := server.NewStore(filepath.Join(t.TempDir(), "server"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	account, token, err := store.CreateAccount("dir-user", "", "", "password123", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetAccountSyncEnabled(account.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(store, "", slog.Default()).Handler())
+	defer srv.Close()
+
+	engineA := newTestEngine(t, srv.URL, token, "dir-a", filepath.Join(t.TempDir(), "client-a"))
+	engineB := newTestEngine(t, srv.URL, token, "dir-b", filepath.Join(t.TempDir(), "client-b"))
+	ctx := context.Background()
+
+	emptyDirA := filepath.Join(engineA.cfg.LocalRoot, "docs", "empty")
+	if err := os.MkdirAll(emptyDirA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineA.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertDirExists(t, filepath.Join(engineB.cfg.LocalRoot, "docs"))
+	assertDirExists(t, filepath.Join(engineB.cfg.LocalRoot, "docs", "empty"))
+
+	writeTestFile(t, filepath.Join(engineA.cfg.LocalRoot, "keep", "note.txt"), "content")
+	if err := engineA.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertFileContent(t, filepath.Join(engineB.cfg.LocalRoot, "keep", "note.txt"), "content")
+	if err := os.Remove(filepath.Join(engineA.cfg.LocalRoot, "keep", "note.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineA.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertFileMissing(t, filepath.Join(engineB.cfg.LocalRoot, "keep", "note.txt"))
+	assertDirExists(t, filepath.Join(engineB.cfg.LocalRoot, "keep"))
+}
+
+func TestEmptyFileDeleteDoesNotBehaveLikeDirectoryDelete(t *testing.T) {
+	t.Parallel()
+
+	store, err := server.NewStore(filepath.Join(t.TempDir(), "server"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	account, token, err := store.CreateAccount("empty-file-user", "", "", "password123", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetAccountSyncEnabled(account.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(store, "", slog.Default()).Handler())
+	defer srv.Close()
+
+	engineA := newTestEngine(t, srv.URL, token, "empty-file-a", filepath.Join(t.TempDir(), "client-a"))
+	engineB := newTestEngine(t, srv.URL, token, "empty-file-b", filepath.Join(t.TempDir(), "client-b"))
+	ctx := context.Background()
+
+	writeTestFile(t, filepath.Join(engineA.cfg.LocalRoot, "folder", "empty.txt"), "")
+	if err := engineA.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertFileContent(t, filepath.Join(engineB.cfg.LocalRoot, "folder", "empty.txt"), "")
+
+	if err := os.Remove(filepath.Join(engineA.cfg.LocalRoot, "folder", "empty.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineA.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertFileMissing(t, filepath.Join(engineB.cfg.LocalRoot, "folder", "empty.txt"))
+	assertDirExists(t, filepath.Join(engineB.cfg.LocalRoot, "folder"))
+}
+
+func TestEmptyDirectoryDeleteSyncsToOtherClients(t *testing.T) {
+	t.Parallel()
+
+	store, err := server.NewStore(filepath.Join(t.TempDir(), "server"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	account, token, err := store.CreateAccount("dir-delete-user", "", "", "password123", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetAccountSyncEnabled(account.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(store, "", slog.Default()).Handler())
+	defer srv.Close()
+
+	engineA := newTestEngine(t, srv.URL, token, "dir-delete-a", filepath.Join(t.TempDir(), "client-a"))
+	engineB := newTestEngine(t, srv.URL, token, "dir-delete-b", filepath.Join(t.TempDir(), "client-b"))
+	ctx := context.Background()
+
+	targetA := filepath.Join(engineA.cfg.LocalRoot, "remove-me")
+	if err := os.MkdirAll(targetA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineA.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertDirExists(t, filepath.Join(engineB.cfg.LocalRoot, "remove-me"))
+
+	if err := os.Remove(targetA); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineA.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertFileMissing(t, filepath.Join(engineB.cfg.LocalRoot, "remove-me"))
+}
+
+func TestNonEmptyDirectoryDeleteSyncsToOtherClients(t *testing.T) {
+	t.Parallel()
+
+	store, err := server.NewStore(filepath.Join(t.TempDir(), "server"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	account, token, err := store.CreateAccount("dir-tree-delete-user", "", "", "password123", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetAccountSyncEnabled(account.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(store, "", slog.Default()).Handler())
+	defer srv.Close()
+
+	engineA := newTestEngine(t, srv.URL, token, "dir-tree-delete-a", filepath.Join(t.TempDir(), "client-a"))
+	engineB := newTestEngine(t, srv.URL, token, "dir-tree-delete-b", filepath.Join(t.TempDir(), "client-b"))
+	ctx := context.Background()
+
+	writeTestFile(t, filepath.Join(engineA.cfg.LocalRoot, "tree", "child", "note.txt"), "content")
+	if err := engineA.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertFileContent(t, filepath.Join(engineB.cfg.LocalRoot, "tree", "child", "note.txt"), "content")
+
+	if err := os.RemoveAll(filepath.Join(engineA.cfg.LocalRoot, "tree")); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineA.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertFileMissing(t, filepath.Join(engineB.cfg.LocalRoot, "tree"))
+}
+
 func TestSupervisorSyncsEveryActiveSpaceUnderXCloudRoot(t *testing.T) {
 	t.Parallel()
 
@@ -235,5 +424,16 @@ func assertFileMissing(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("%s exists or stat failed with %v, want missing", path, err)
+	}
+}
+
+func assertDirExists(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%s is not a directory", path)
 	}
 }

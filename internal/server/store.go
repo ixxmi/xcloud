@@ -1314,10 +1314,20 @@ func (s *Store) Commit(accountID, spaceID string, req syncmodel.CommitRequest) (
 	}
 	req.RootPath = strings.TrimSpace(req.RootPath)
 	manifest := req.Manifest
-	if manifest.Path == "" || manifest.Hash == "" {
-		return syncmodel.CommitResponse{}, errors.New("manifest path and hash are required")
+	if manifest.Path == "" {
+		return syncmodel.CommitResponse{}, errors.New("manifest path is required")
 	}
-	if !isHash(manifest.Hash) {
+	state := strings.TrimSpace(manifest.State)
+	if state == "" {
+		state = syncmodel.EntryFile
+	}
+	if state != syncmodel.EntryFile && state != syncmodel.EntryDir {
+		return syncmodel.CommitResponse{}, errors.New("invalid manifest state")
+	}
+	if state == syncmodel.EntryFile && manifest.Hash == "" {
+		return syncmodel.CommitResponse{}, errors.New("manifest hash is required")
+	}
+	if state == syncmodel.EntryFile && !isHash(manifest.Hash) {
 		return syncmodel.CommitResponse{}, errors.New("invalid file hash")
 	}
 	if _, ok := s.GetSpace(accountID, spaceID); !ok {
@@ -1327,17 +1337,37 @@ func (s *Store) Commit(accountID, spaceID string, req syncmodel.CommitRequest) (
 	if err != nil {
 		return syncmodel.CommitResponse{}, err
 	}
-	if err := s.verifyManifest(accountID, manifest); err != nil {
-		return syncmodel.CommitResponse{}, err
+	if state == syncmodel.EntryFile {
+		if err := s.verifyManifest(accountID, manifest); err != nil {
+			return syncmodel.CommitResponse{}, err
+		}
+	} else if manifest.Hash != "" || manifest.Size != 0 || len(manifest.Chunks) != 0 {
+		return syncmodel.CommitResponse{}, errors.New("directory manifest cannot include file content")
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.ensureParentDirsLocked(accountID, spaceID, path, req.DeviceID, req.RootPath, manifest.ModTimeUnix); err != nil {
+		return syncmodel.CommitResponse{}, err
+	}
 	opKey := operationKey(accountID, spaceID, req.OperationID)
 	if existing, ok := s.state.Operations[opKey]; ok {
 		return existing, nil
 	}
 
+	resp, err := s.commitEntryLocked(accountID, spaceID, req, path, state)
+	if err != nil {
+		return syncmodel.CommitResponse{}, err
+	}
+	s.state.Operations[opKey] = resp
+	if err := s.saveLocked(); err != nil {
+		return syncmodel.CommitResponse{}, err
+	}
+	return resp, nil
+}
+
+func (s *Store) commitEntryLocked(accountID, spaceID string, req syncmodel.CommitRequest, path, state string) (syncmodel.CommitResponse, error) {
+	manifest := req.Manifest
 	now := time.Now().Unix()
 	key := fileKey(accountID, spaceID, path)
 	entry := s.state.Files[key]
@@ -1356,6 +1386,14 @@ func (s *Store) Commit(accountID, spaceID string, req syncmodel.CommitRequest) (
 
 	conflict := false
 	conflictPath := ""
+	if state == syncmodel.EntryDir && entry.Current != nil && entry.Current.State == syncmodel.EntryDir && !entry.Deleted {
+		resp := syncmodel.CommitResponse{
+			Status:  "ok",
+			Entry:   *entry,
+			Version: *entry.Current,
+		}
+		return resp, nil
+	}
 	if entry.Current != nil && manifest.BaseVersion != entry.Current.VersionID {
 		conflict = true
 		conflictPath = s.nextConflictPathLocked(path, req.DeviceID, now)
@@ -1376,7 +1414,7 @@ func (s *Store) Commit(accountID, spaceID string, req syncmodel.CommitRequest) (
 		Path:        path,
 		VersionID:   fileutil.NewID(),
 		BaseVersion: manifest.BaseVersion,
-		State:       syncmodel.EntryFile,
+		State:       state,
 		Size:        manifest.Size,
 		Hash:        manifest.Hash,
 		Chunks:      append([]syncmodel.ChunkRef(nil), manifest.Chunks...),
@@ -1390,9 +1428,11 @@ func (s *Store) Commit(accountID, spaceID string, req syncmodel.CommitRequest) (
 	entry.LatestVersion = version.VersionID
 	entry.UpdatedAt = now
 	s.state.Versions[entry.FileID] = append(s.state.Versions[entry.FileID], version)
-	for _, chunk := range version.Chunks {
-		s.state.ChunkRefs[chunk.Hash]++
-		s.state.AccountChunks[accountChunkKey(accountID, chunk.Hash)] = true
+	if state == syncmodel.EntryFile {
+		for _, chunk := range version.Chunks {
+			s.state.ChunkRefs[chunk.Hash]++
+			s.state.AccountChunks[accountChunkKey(accountID, chunk.Hash)] = true
+		}
 	}
 	s.appendEventLocked(version)
 
@@ -1403,11 +1443,40 @@ func (s *Store) Commit(accountID, spaceID string, req syncmodel.CommitRequest) (
 		Conflict:     conflict,
 		ConflictPath: conflictPath,
 	}
-	s.state.Operations[opKey] = resp
-	if err := s.saveLocked(); err != nil {
-		return syncmodel.CommitResponse{}, err
-	}
 	return resp, nil
+}
+
+func (s *Store) ensureParentDirsLocked(accountID, spaceID, path, deviceID, rootPath string, modTimeUnix int64) error {
+	dir := filepath.ToSlash(filepath.Dir(path))
+	if dir == "." || dir == "/" || dir == "" {
+		return nil
+	}
+	parts := strings.Split(dir, "/")
+	current := ""
+	for _, part := range parts {
+		if current == "" {
+			current = part
+		} else {
+			current += "/" + part
+		}
+		entry := s.state.Files[fileKey(accountID, spaceID, current)]
+		if entry != nil && !entry.Deleted && entry.Current != nil && entry.Current.State == syncmodel.EntryDir {
+			continue
+		}
+		req := syncmodel.CommitRequest{
+			DeviceID: deviceID,
+			RootPath: rootPath,
+			Manifest: syncmodel.Manifest{
+				Path:        current,
+				State:       syncmodel.EntryDir,
+				ModTimeUnix: modTimeUnix,
+			},
+		}
+		if _, err := s.commitEntryLocked(accountID, spaceID, req, current, syncmodel.EntryDir); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) Delete(accountID, spaceID string, req syncmodel.DeleteRequest) (syncmodel.CommitResponse, error) {
@@ -1475,21 +1544,28 @@ func (s *Store) Delete(accountID, spaceID string, req syncmodel.DeleteRequest) (
 		previous = *entry.Current
 	}
 	version := syncmodel.FileVersion{
-		AccountID:   accountID,
-		SpaceID:     spaceID,
-		FileID:      entry.FileID,
-		Path:        path,
-		VersionID:   fileutil.NewID(),
-		BaseVersion: req.BaseVersion,
-		State:       syncmodel.EntryDeleted,
-		Size:        previous.Size,
-		Hash:        previous.Hash,
-		Chunks:      append([]syncmodel.ChunkRef(nil), previous.Chunks...),
-		ModTimeUnix: previous.ModTimeUnix,
-		DeletedAt:   now,
-		DeviceID:    req.DeviceID,
-		RootPath:    req.RootPath,
-		CreatedAt:   now,
+		AccountID:    accountID,
+		SpaceID:      spaceID,
+		FileID:       entry.FileID,
+		Path:         path,
+		VersionID:    fileutil.NewID(),
+		BaseVersion:  req.BaseVersion,
+		State:        syncmodel.EntryDeleted,
+		DeletedState: previous.State,
+		Size:         previous.Size,
+		Hash:         previous.Hash,
+		Chunks:       append([]syncmodel.ChunkRef(nil), previous.Chunks...),
+		ModTimeUnix:  previous.ModTimeUnix,
+		DeletedAt:    now,
+		DeviceID:     req.DeviceID,
+		RootPath:     req.RootPath,
+		CreatedAt:    now,
+	}
+	if entry.Current != nil && entry.Current.State == syncmodel.EntryDir {
+		version.Size = 0
+		version.Hash = ""
+		version.Chunks = nil
+		version.ModTimeUnix = 0
 	}
 	entry.Current = &version
 	entry.Deleted = true
@@ -1523,6 +1599,9 @@ func (s *Store) ListTrash(accountID string, limit int) []syncmodel.TrashEntry {
 	out := make([]syncmodel.TrashEntry, 0, limit)
 	for _, entry := range s.state.Files {
 		if entry.AccountID != accountID || !entry.Deleted || entry.Current == nil || entry.Current.State != syncmodel.EntryDeleted {
+			continue
+		}
+		if entry.Current.DeletedState == syncmodel.EntryDir {
 			continue
 		}
 		trash := trashEntryFromVersion(*entry.Current)

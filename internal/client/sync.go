@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -61,6 +62,7 @@ type Supervisor struct {
 type localScanEntry struct {
 	Path        string
 	AbsPath     string
+	State       string
 	Size        int64
 	ModTimeUnix int64
 	Hash        string
@@ -618,6 +620,15 @@ func (e *Engine) pushLocal(ctx context.Context) error {
 			return err
 		}
 		known, ok := e.state.Get(rel)
+		if entry.State == syncmodel.EntryDir {
+			if ok && known.State == syncmodel.EntryDir {
+				continue
+			}
+			if err := e.uploadDir(entry, known); err != nil {
+				return err
+			}
+			continue
+		}
 		if ok && known.State == syncmodel.EntryFile && known.Hash == entry.Hash && known.Size == entry.Size {
 			if known.ModTimeUnix != entry.ModTimeUnix {
 				known.ModTimeUnix = entry.ModTimeUnix
@@ -637,7 +648,7 @@ func (e *Engine) pushLocal(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if known.State != syncmodel.EntryFile {
+		if known.State != syncmodel.EntryFile && known.State != syncmodel.EntryDir {
 			continue
 		}
 		if _, ok := scan[rel]; ok {
@@ -659,11 +670,12 @@ func (e *Engine) pushLocal(ctx context.Context) error {
 		}
 		if resp.Status == "ok" {
 			if err := e.state.Set(rel, syncmodel.LocalFileState{
-				Path:      rel,
-				FileID:    known.FileID,
-				VersionID: resp.Version.VersionID,
-				State:     syncmodel.EntryDeleted,
-				UpdatedAt: time.Now().Unix(),
+				Path:         rel,
+				FileID:       known.FileID,
+				VersionID:    resp.Version.VersionID,
+				State:        syncmodel.EntryDeleted,
+				DeletedState: known.State,
+				UpdatedAt:    time.Now().Unix(),
 			}); err != nil {
 				e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
 				return err
@@ -688,6 +700,34 @@ func (e *Engine) reportRecord(action, status, path string, err error, duration t
 		req.Error = err.Error()
 	}
 	_ = e.api.ReportSyncRecord(req)
+}
+
+func (e *Engine) uploadDir(entry localScanEntry, known syncmodel.LocalFileState) error {
+	started := time.Now()
+	req := syncmodel.CommitRequest{
+		OperationID: fileutil.NewID(),
+		DeviceID:    e.cfg.DeviceID,
+		RootPath:    e.cfg.Root,
+		Manifest: syncmodel.Manifest{
+			FileID:      known.FileID,
+			Path:        entry.Path,
+			BaseVersion: known.VersionID,
+			State:       syncmodel.EntryDir,
+			ModTimeUnix: entry.ModTimeUnix,
+		},
+	}
+	e.log.Info("commit dir", "path", entry.Path)
+	resp, err := e.api.Commit(req)
+	if err != nil {
+		e.reportRecord(syncmodel.SyncActionUpload, syncmodel.SyncRecordStatusFailed, entry.Path, err, time.Since(started))
+		return err
+	}
+	if err := e.state.Set(resp.Version.Path, stateFromVersion(resp.Version)); err != nil {
+		e.reportRecord(syncmodel.SyncActionUpload, syncmodel.SyncRecordStatusFailed, entry.Path, err, time.Since(started))
+		return err
+	}
+	e.reportRecord(syncmodel.SyncActionUpload, syncmodel.SyncRecordStatusSuccess, resp.Version.Path, nil, time.Since(started))
+	return nil
 }
 
 func (e *Engine) uploadFile(ctx context.Context, entry localScanEntry, known syncmodel.LocalFileState) error {
@@ -730,6 +770,7 @@ func (e *Engine) uploadFile(ctx context.Context, entry localScanEntry, known syn
 			FileID:      known.FileID,
 			Path:        entry.Path,
 			BaseVersion: known.VersionID,
+			State:       syncmodel.EntryFile,
 			Size:        entry.Size,
 			Hash:        entry.Hash,
 			Chunks:      entry.Chunks,
@@ -792,6 +833,29 @@ func (e *Engine) pullRemote(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := e.cleanupDeletedDirs(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) cleanupDeletedDirs() error {
+	states := e.state.Snapshot()
+	dirs := make([]string, 0)
+	for rel, state := range states {
+		if state.State == syncmodel.EntryDeleted && state.DeletedState == syncmodel.EntryDir {
+			dirs = append(dirs, rel)
+		}
+	}
+	sort.Slice(dirs, func(i, j int) bool {
+		return len(dirs[i]) > len(dirs[j])
+	})
+	for _, rel := range dirs {
+		target := filepath.Join(e.cfg.LocalRoot, filepath.FromSlash(rel))
+		if err := removeDirIfEmpty(target); err != nil && !errors.Is(err, errDirectoryNotEmpty) {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -809,6 +873,18 @@ func (e *Engine) applyVersion(ctx context.Context, version syncmodel.FileVersion
 		if hasKnown && known.VersionID == version.VersionID {
 			return nil
 		}
+		if tombstoneEntryState(version, known) == syncmodel.EntryDir {
+			if err := removeDirIfEmpty(target); err != nil && !errors.Is(err, errDirectoryNotEmpty) {
+				e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
+				return err
+			}
+			if err := e.state.Set(rel, stateFromVersion(version)); err != nil {
+				e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
+				return err
+			}
+			e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusSuccess, rel, nil, time.Since(started))
+			return nil
+		}
 		if hasLocalDivergence(target, known) {
 			conflict := conflictLocalPath(target, e.cfg.DeviceID)
 			e.log.Warn("local delete conflict preserved", "path", rel, "conflict", conflict)
@@ -824,12 +900,30 @@ func (e *Engine) applyVersion(ctx context.Context, version syncmodel.FileVersion
 			e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
 			return err
 		}
-		cleanupEmptyParents(e.cfg.LocalRoot, filepath.Dir(target))
 		if err := e.state.Set(rel, stateFromVersion(version)); err != nil {
 			e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
 			return err
 		}
 		e.reportRecord(syncmodel.SyncActionDelete, syncmodel.SyncRecordStatusSuccess, rel, nil, time.Since(started))
+		return nil
+	case syncmodel.EntryDir:
+		if hasKnown && known.VersionID == version.VersionID {
+			e.reportRecord(syncmodel.SyncActionSkip, syncmodel.SyncRecordStatusSuccess, rel, nil, time.Since(started))
+			return nil
+		}
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			e.reportRecord(syncmodel.SyncActionDownload, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
+			return err
+		}
+		if version.ModTimeUnix > 0 {
+			t := time.Unix(version.ModTimeUnix, 0)
+			_ = os.Chtimes(target, t, t)
+		}
+		if err := e.state.Set(rel, stateFromVersion(version)); err != nil {
+			e.reportRecord(syncmodel.SyncActionDownload, syncmodel.SyncRecordStatusFailed, rel, err, time.Since(started))
+			return err
+		}
+		e.reportRecord(syncmodel.SyncActionDownload, syncmodel.SyncRecordStatusSuccess, rel, nil, time.Since(started))
 		return nil
 	case syncmodel.EntryFile:
 		if hasKnown && known.VersionID == version.VersionID {
@@ -937,6 +1031,12 @@ func (e *Engine) scanLocal() (map[string]localScanEntry, error) {
 			return nil
 		}
 		if d.IsDir() {
+			out[rel] = localScanEntry{
+				Path:        rel,
+				AbsPath:     path,
+				State:       syncmodel.EntryDir,
+				ModTimeUnix: info.ModTime().Unix(),
+			}
 			return nil
 		}
 		if !info.Mode().IsRegular() {
@@ -949,6 +1049,7 @@ func (e *Engine) scanLocal() (map[string]localScanEntry, error) {
 		out[rel] = localScanEntry{
 			Path:        rel,
 			AbsPath:     path,
+			State:       syncmodel.EntryFile,
 			Size:        size,
 			ModTimeUnix: info.ModTime().Unix(),
 			Hash:        hash,
@@ -960,6 +1061,13 @@ func (e *Engine) scanLocal() (map[string]localScanEntry, error) {
 }
 
 func hasLocalDivergence(path string, known syncmodel.LocalFileState) bool {
+	if known.State == syncmodel.EntryDir {
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+		return err != nil || !info.IsDir()
+	}
 	if known.State != syncmodel.EntryFile {
 		_, err := os.Stat(path)
 		return err == nil
@@ -984,6 +1092,35 @@ func hasLocalDivergence(path string, known syncmodel.LocalFileState) bool {
 	return size != known.Size || hash != known.Hash
 }
 
+func tombstoneEntryState(version syncmodel.FileVersion, known syncmodel.LocalFileState) string {
+	if version.DeletedState != "" {
+		return version.DeletedState
+	}
+	return known.State
+}
+
+func removeDirIfEmpty(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if isDirectoryNotEmpty(err) {
+			return errDirectoryNotEmpty
+		}
+		return err
+	}
+	return nil
+}
+
+var errDirectoryNotEmpty = errors.New("directory not empty")
+
+func isDirectoryNotEmpty(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "directory not empty")
+}
+
 func conflictLocalPath(path, deviceID string) string {
 	ext := filepath.Ext(path)
 	stem := strings.TrimSuffix(path, ext)
@@ -994,23 +1131,6 @@ func conflictLocalPath(path, deviceID string) string {
 		return '-'
 	}, deviceID)
 	return fmt.Sprintf("%s (local conflict from %s at %s)%s", stem, safeDevice, time.Now().Format("20060102-150405"), ext)
-}
-
-func cleanupEmptyParents(root, dir string) {
-	rootAbs, err := filepath.Abs(root)
-	if err != nil {
-		return
-	}
-	for {
-		dirAbs, err := filepath.Abs(dir)
-		if err != nil || dirAbs == rootAbs || !fileutil.PathWithin(rootAbs, dirAbs) {
-			return
-		}
-		if err := os.Remove(dirAbs); err != nil {
-			return
-		}
-		dir = filepath.Dir(dirAbs)
-	}
 }
 
 func defaultDeviceID(deviceID, storageRoot, serverURL string) string {
@@ -1092,14 +1212,15 @@ func safeStateName(v string) string {
 
 func stateFromVersion(version syncmodel.FileVersion) syncmodel.LocalFileState {
 	return syncmodel.LocalFileState{
-		Path:        version.Path,
-		FileID:      version.FileID,
-		VersionID:   version.VersionID,
-		State:       version.State,
-		Size:        version.Size,
-		Hash:        version.Hash,
-		Chunks:      append([]syncmodel.ChunkRef(nil), version.Chunks...),
-		ModTimeUnix: version.ModTimeUnix,
-		UpdatedAt:   time.Now().Unix(),
+		Path:         version.Path,
+		FileID:       version.FileID,
+		VersionID:    version.VersionID,
+		State:        version.State,
+		DeletedState: version.DeletedState,
+		Size:         version.Size,
+		Hash:         version.Hash,
+		Chunks:       append([]syncmodel.ChunkRef(nil), version.Chunks...),
+		ModTimeUnix:  version.ModTimeUnix,
+		UpdatedAt:    time.Now().Unix(),
 	}
 }

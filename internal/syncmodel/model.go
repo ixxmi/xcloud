@@ -8,6 +8,7 @@ const (
 	TrashRetentionSeconds      = 10 * 24 * 60 * 60
 
 	EntryFile    = "file"
+	EntryDir     = "dir"
 	EntryDeleted = "deleted"
 
 	FolderPending  = "pending"
@@ -136,21 +137,22 @@ type ChunkRef struct {
 }
 
 type FileVersion struct {
-	AccountID   string     `json:"account_id,omitempty"`
-	SpaceID     string     `json:"space_id,omitempty"`
-	FileID      string     `json:"file_id"`
-	Path        string     `json:"path"`
-	VersionID   string     `json:"version_id"`
-	BaseVersion string     `json:"base_version,omitempty"`
-	State       string     `json:"state"`
-	Size        int64      `json:"size"`
-	Hash        string     `json:"hash,omitempty"`
-	Chunks      []ChunkRef `json:"chunks,omitempty"`
-	ModTimeUnix int64      `json:"mod_time_unix,omitempty"`
-	DeletedAt   int64      `json:"deleted_at,omitempty"`
-	DeviceID    string     `json:"device_id"`
-	RootPath    string     `json:"root_path,omitempty"`
-	CreatedAt   int64      `json:"created_at"`
+	AccountID    string     `json:"account_id,omitempty"`
+	SpaceID      string     `json:"space_id,omitempty"`
+	FileID       string     `json:"file_id"`
+	Path         string     `json:"path"`
+	VersionID    string     `json:"version_id"`
+	BaseVersion  string     `json:"base_version,omitempty"`
+	State        string     `json:"state"`
+	DeletedState string     `json:"deleted_state,omitempty"`
+	Size         int64      `json:"size"`
+	Hash         string     `json:"hash,omitempty"`
+	Chunks       []ChunkRef `json:"chunks,omitempty"`
+	ModTimeUnix  int64      `json:"mod_time_unix,omitempty"`
+	DeletedAt    int64      `json:"deleted_at,omitempty"`
+	DeviceID     string     `json:"device_id"`
+	RootPath     string     `json:"root_path,omitempty"`
+	CreatedAt    int64      `json:"created_at"`
 }
 
 type FileEntry struct {
@@ -165,15 +167,16 @@ type FileEntry struct {
 }
 
 type LocalFileState struct {
-	Path        string     `json:"path"`
-	FileID      string     `json:"file_id"`
-	VersionID   string     `json:"version_id"`
-	State       string     `json:"state"`
-	Size        int64      `json:"size"`
-	Hash        string     `json:"hash,omitempty"`
-	Chunks      []ChunkRef `json:"chunks,omitempty"`
-	ModTimeUnix int64      `json:"mod_time_unix,omitempty"`
-	UpdatedAt   int64      `json:"updated_at"`
+	Path         string     `json:"path"`
+	FileID       string     `json:"file_id"`
+	VersionID    string     `json:"version_id"`
+	State        string     `json:"state"`
+	DeletedState string     `json:"deleted_state,omitempty"`
+	Size         int64      `json:"size"`
+	Hash         string     `json:"hash,omitempty"`
+	Chunks       []ChunkRef `json:"chunks,omitempty"`
+	ModTimeUnix  int64      `json:"mod_time_unix,omitempty"`
+	UpdatedAt    int64      `json:"updated_at"`
 }
 
 type ServerState struct {
@@ -326,6 +329,7 @@ type Manifest struct {
 	FileID      string     `json:"file_id,omitempty"`
 	Path        string     `json:"path"`
 	BaseVersion string     `json:"base_version,omitempty"`
+	State       string     `json:"state,omitempty"`
 	Size        int64      `json:"size"`
 	Hash        string     `json:"hash"`
 	Chunks      []ChunkRef `json:"chunks"`
