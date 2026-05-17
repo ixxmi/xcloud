@@ -112,10 +112,10 @@ names are easy to manage:
 ./scripts/xcloud-watchdog.sh client
 ```
 
-- server process binary: `bin/xclouds`
-- client process binary: `bin/xcloudc`
-- logs: `logs/xclouds.log` and `logs/xcloudc.log`
-- lock dirs: `run/xclouds.lock` and `run/xcloudc.lock`
+- server process binary: `xcloud-runtime/bin/xclouds`
+- client process binary: `xcloud-runtime/bin/xcloudc`
+- logs: `xcloud-runtime/logs/xclouds.log` and `xcloud-runtime/logs/xcloudc.log`
+- lock dirs: `xcloud-runtime/run/xclouds.lock` and `xcloud-runtime/run/xcloudc.lock`
 
 The watchdog restarts the child process after an unexpected exit. Extra CLI
 arguments are passed through, for example:
