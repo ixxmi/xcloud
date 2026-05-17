@@ -42,29 +42,43 @@ func main() {
 
 func runServer(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
-	addr := fs.String("addr", ":8080", "HTTP listen address")
-	data := fs.String("data", "./xcloud-data", "server data directory")
+	configPath := fs.String("config", env("XCLOUD_SERVER_CONFIG", server.DefaultRuntimeConfigPath), "server runtime config path")
+	addr := fs.String("addr", "", "HTTP listen address; overrides config")
+	data := fs.String("data", "", "server data directory; overrides config")
 	token := fs.String("token", env("XCLOUD_TOKEN", ""), "Bearer token; can also use XCLOUD_TOKEN")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	store, err := server.NewStore(*data)
+	runtimeConfig, err := server.LoadRuntimeConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if *addr != "" {
+		if err := runtimeConfig.ApplyListenAddr(*addr); err != nil {
+			return err
+		}
+	}
+	if *data != "" {
+		runtimeConfig.DataDir = *data
+	}
+	runtimeConfig.Normalize()
+	store, err := server.NewStore(runtimeConfig.DataDir)
 	if err != nil {
 		return err
 	}
 	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           server.New(store, *token, log).Handler(),
+		Addr:              runtimeConfig.ListenAddr(),
+		Handler:           server.NewWithRuntimeConfig(store, *token, log, runtimeConfig).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Info("xcloud server listening", "addr", *addr, "data", *data)
+	log.Info("xcloud server listening", "addr", runtimeConfig.ListenAddr(), "public_url", runtimeConfig.PublicURL(), "data", runtimeConfig.DataDir, "config", runtimeConfig.Path)
 	return srv.ListenAndServe()
 }
 
 func runClient(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
 	root := fs.String("root", "", "client xcloud storage root; defaults to <working-directory>/xcloud")
-	serverURL := fs.String("server", "http://127.0.0.1:8080", "server URL")
+	serverURL := fs.String("server", "http://ixxmi.com:18002", "server URL")
 	token := fs.String("token", env("XCLOUD_TOKEN", ""), "account sync token; can also use XCLOUD_TOKEN")
 	clientAddr := fs.String("client-addr", "127.0.0.1:18080", "local client management console address when token is omitted")
 	clientConfig := fs.String("client-config", "", "local client config path; defaults to ~/.xcloud/client-config.json")
@@ -144,10 +158,10 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `xcloud - secure central file sync MVP
 
 Usage:
-  xcloud server -addr :8080 -data ./xcloud-data
+  xcloud server
   mkdir -p ./xcloud
-  xcloud client -server http://127.0.0.1:8080
-  xcloud client -root /data/xcloud -server http://127.0.0.1:8080 -token account-token
+  xcloud client
+  xcloud client -root /data/xcloud -server http://ixxmi.com:18002 -token account-token
 
 Commands:
   server    start the central sync server

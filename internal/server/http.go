@@ -19,10 +19,11 @@ import (
 const sessionCookie = "xcloud_session"
 
 type Server struct {
-	store    *Store
-	log      *slog.Logger
-	sessions map[string]string
-	mu       sync.Mutex
+	store         *Store
+	log           *slog.Logger
+	sessions      map[string]string
+	runtimeConfig RuntimeConfig
+	mu            sync.Mutex
 }
 
 type syncContext struct {
@@ -33,13 +34,19 @@ type syncContext struct {
 }
 
 func New(store *Store, _ string, log *slog.Logger) *Server {
+	return NewWithRuntimeConfig(store, "", log, DefaultRuntimeConfig(""))
+}
+
+func NewWithRuntimeConfig(store *Store, _ string, log *slog.Logger, runtimeConfig RuntimeConfig) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
+	runtimeConfig.Normalize()
 	return &Server{
-		store:    store,
-		log:      log,
-		sessions: map[string]string{},
+		store:         store,
+		log:           log,
+		sessions:      map[string]string{},
+		runtimeConfig: runtimeConfig,
 	}
 }
 
@@ -61,6 +68,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/clients/storage-root", s.requireLogin(s.adminSetClientStorageRoot))
 	mux.HandleFunc("POST /admin/trash/restore", s.requireLogin(s.adminRestoreTrash))
 	mux.HandleFunc("POST /admin/sync-settings/update", s.requireLogin(s.adminUpdateSyncSettings))
+	mux.HandleFunc("POST /admin/server-config/update", s.requireAdmin(s.adminUpdateServerConfig))
 
 	mux.HandleFunc("POST /v1/client/login", s.clientLogin)
 	mux.HandleFunc("GET /v1/client/status", s.clientAuth(s.clientStatus))
@@ -563,6 +571,26 @@ func (s *Server) adminUpdateSyncSettings(w http.ResponseWriter, r *http.Request,
 	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "同步触发规则已更新"}, dashboardOptions{View: "settings"})
 }
 
+func (s *Server) adminUpdateServerConfig(w http.ResponseWriter, r *http.Request, account syncmodel.Account) {
+	if err := r.ParseForm(); err != nil {
+		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "server"})
+		return
+	}
+	cfg := s.runtimeConfig
+	cfg.Domain = r.Form.Get("domain")
+	cfg.Port = atoiDefault(r.Form.Get("port"), 18002)
+	cfg.DataDir = r.Form.Get("data_dir")
+	cfg.ListenHost = r.Form.Get("listen_host")
+	cfg.Normalize()
+	cfg.Path = s.runtimeConfig.Path
+	if err := SaveRuntimeConfig(cfg); err != nil {
+		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "server"})
+		return
+	}
+	s.runtimeConfig = cfg
+	s.renderDashboard(w, account, flashMessage{Kind: "success", Text: "服务配置已保存。域名立即用于页面提示；端口和 data 目录需要重启服务端进程后生效。"}, dashboardOptions{View: "server"})
+}
+
 func (s *Server) requireLogin(next func(http.ResponseWriter, *http.Request, syncmodel.Account)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		account, ok := s.sessionAccount(r)
@@ -718,16 +746,19 @@ func (s *Server) renderDashboard(w http.ResponseWriter, account syncmodel.Accoun
 		"formatTime": formatUnixTime,
 	}).Parse(dashboardHTML))
 	_ = page.Execute(w, map[string]any{
-		"Account":       account,
-		"Accounts":      accounts,
-		"Groups":        groups,
-		"Flash":         flash,
-		"TotalAccounts": len(accounts),
-		"TotalSpaces":   totalSpaces,
-		"ActiveSpaces":  activeSpaces,
-		"TotalFiles":    totalFiles,
-		"TotalDeleted":  totalDeleted,
-		"InitialView":   options.View,
+		"Account":        account,
+		"Accounts":       accounts,
+		"Groups":         groups,
+		"Flash":          flash,
+		"TotalAccounts":  len(accounts),
+		"TotalSpaces":    totalSpaces,
+		"ActiveSpaces":   activeSpaces,
+		"TotalFiles":     totalFiles,
+		"TotalDeleted":   totalDeleted,
+		"InitialView":    options.View,
+		"RuntimeConfig":  s.runtimeConfig,
+		"PublicURL":      s.runtimeConfig.PublicURL(),
+		"CurrentDataDir": s.store.Root(),
 	})
 }
 
@@ -917,6 +948,7 @@ const dashboardHTML = `<!doctype html>
         <button type="button" data-view-target="records">◴ 同步记录</button>
         {{if .Account.IsAdmin}}<button type="button" data-view-target="accounts">◎ 账号管理</button>{{end}}
         <button type="button" data-view-target="settings">⚙ 同步设置</button>
+        {{if .Account.IsAdmin}}<button type="button" data-view-target="server">◉ 服务配置</button>{{end}}
         <button type="button" data-view-target="security">⚿ 安全设置</button>
       </nav>
       <div class="logout"><form method="post" action="/admin/logout"><button type="submit">退出登录</button></form></div>
@@ -952,7 +984,7 @@ const dashboardHTML = `<!doctype html>
           <section class="panel" style="margin-top:18px">
             <h2>客户端命令</h2>
             <p class="muted">客户端首次启动无需 token。打开本机客户端页面登录云端账号并开启同步后，只要文件放在 xcloud 目录下就会参与同步。</p>
-            <div class="cmd">mkdir -p ./xcloud && ./xcloud client -server http://127.0.0.1:8080</div>
+            <div class="cmd">mkdir -p ./xcloud && ./xcloud client -server {{.PublicURL}}</div>
             <p class="muted">默认保存根目录是客户端进程启动目录下的 xcloud。默认 Space 对应 xcloud/default；其他 Space 对应 xcloud/&lt;space-id&gt;。</p>
           </section>
         </section>
@@ -1149,6 +1181,42 @@ const dashboardHTML = `<!doctype html>
         </section>
 
         {{if .Account.IsAdmin}}
+        <section class="view" data-view="server">
+          <div class="two">
+            <section class="panel">
+              <h2>服务配置</h2>
+              <p class="muted">这里配置管理端对外地址、监听端口和服务端 data 目录。域名用于页面提示；端口和 data 目录需要重启服务端进程后生效。</p>
+              <form method="post" action="/admin/server-config/update">
+                <label>默认域名</label>
+                <input name="domain" value="{{.RuntimeConfig.Domain}}" placeholder="ixxmi.com" required>
+                <div class="form-grid">
+                  <div>
+                    <label>固定端口</label>
+                    <input name="port" type="number" min="1" max="65535" value="{{.RuntimeConfig.Port}}" required>
+                  </div>
+                  <div>
+                    <label>监听主机</label>
+                    <input name="listen_host" value="{{.RuntimeConfig.ListenHost}}" placeholder="留空表示 0.0.0.0">
+                  </div>
+                </div>
+                <label>data 目录</label>
+                <input name="data_dir" value="{{.RuntimeConfig.DataDir}}" placeholder="server-data" required>
+                <button type="submit">保存服务配置</button>
+              </form>
+            </section>
+            <aside>
+              <section class="panel">
+                <h2>当前生效状态</h2>
+                <p class="muted">当前对外地址</p>
+                <div class="cmd">{{.PublicURL}}</div>
+                <p class="muted">当前已打开的 data 目录</p>
+                <div class="cmd">{{.CurrentDataDir}}</div>
+                <p class="muted">如果修改端口或 data 目录，请使用自动重启脚本重启服务端进程。脚本会使用配置文件启动，不需要再传 <code>-addr</code> 或 <code>-data</code>。</p>
+              </section>
+            </aside>
+          </div>
+        </section>
+
         <section class="view" data-view="accounts">
           <div class="two">
             <section class="panel">

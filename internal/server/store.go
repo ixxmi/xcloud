@@ -63,6 +63,10 @@ func NewStore(root string) (*Store, error) {
 	return s, nil
 }
 
+func (s *Store) Root() string {
+	return s.root
+}
+
 func (s *Store) load() error {
 	b, err := os.ReadFile(s.statePath)
 	if errors.Is(err, os.ErrNotExist) {

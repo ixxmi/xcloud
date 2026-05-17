@@ -21,6 +21,10 @@ files placed under their local `xcloud` storage root, grouped by Space.
   from `/admin`; restored files sync back to all clients.
 - The management console can change each client device's global xcloud storage
   root. This is device-level configuration, not per-folder configuration.
+- Clients automatically retry transient network failures, HTTP `429`, and
+  server `5xx` responses. If the network is down for longer than the retry
+  window, the client keeps running and resumes from server events plus local
+  scans after the next successful connection.
 
 The client skips only its internal `.xcloud` state directory, symlinks, and
 non-regular special files.
@@ -40,23 +44,37 @@ GOCACHE=/tmp/go-build-cache go build -o xcloud ./cmd/xcloud
 ## Start Server
 
 ```sh
-./xcloud server -addr :8080 -data ./server-data
+./xcloud server
 ```
 
 Open the management console:
 
 ```text
-http://127.0.0.1:8080/admin
+http://ixxmi.com:18002/admin
 ```
 
 The server stores metadata in `server-data/metadata.json` and chunks under
 `server-data/chunks`.
 
+Server defaults are loaded from `xcloud-server.json`:
+
+```json
+{
+  "domain": "ixxmi.com",
+  "port": 18002,
+  "data_dir": "server-data"
+}
+```
+
+Admins can update the public domain, port, and data directory in `/admin` under
+`服务配置`. Port and data directory changes take effect after restarting the
+server process.
+
 ## Start Client Without Token
 
 ```sh
 mkdir -p ./xcloud
-./xcloud client -server http://127.0.0.1:8080
+./xcloud client
 ```
 
 Open the local client console:
@@ -79,7 +97,29 @@ For a custom client storage root:
 
 ```sh
 mkdir -p /data/xcloud
-./xcloud client -root /data/xcloud -server http://127.0.0.1:8080
+./xcloud client -root /data/xcloud
+```
+
+## Watchdog Startup
+
+The watchdog script builds separate process binaries so the running process
+names are easy to manage:
+
+```sh
+./scripts/xcloud-watchdog.sh server
+./scripts/xcloud-watchdog.sh client
+```
+
+- server process binary: `bin/xclouds`
+- client process binary: `bin/xcloudc`
+- logs: `logs/xclouds.log` and `logs/xcloudc.log`
+- lock dirs: `run/xclouds.lock` and `run/xcloudc.lock`
+
+The watchdog restarts the child process after an unexpected exit. Extra CLI
+arguments are passed through, for example:
+
+```sh
+./scripts/xcloud-watchdog.sh client -root /data/xcloud -server http://ixxmi.com:18002
 ```
 
 ## Token-Based Startup
@@ -91,13 +131,11 @@ mkdir -p /tmp/xcloud-a/default /tmp/xcloud-b/default
 
 ./xcloud client \
   -root /tmp/xcloud-a \
-  -server http://127.0.0.1:8080 \
   -token <account-token> \
   -device laptop-a
 
 ./xcloud client \
   -root /tmp/xcloud-b \
-  -server http://127.0.0.1:8080 \
   -token <same-account-token> \
   -device laptop-b
 ```
@@ -111,7 +149,6 @@ For one sync cycle:
 ```sh
 ./xcloud client \
   -root /tmp/xcloud-a \
-  -server http://127.0.0.1:8080 \
   -token <account-token> \
   -device laptop-a \
   -once
@@ -121,7 +158,7 @@ For one sync cycle:
 
 ```text
 -root           client xcloud storage root; defaults to <working-directory>/xcloud
--server         server URL, default http://127.0.0.1:8080
+-server         server URL, default http://ixxmi.com:18002
 -token          optional account sync token; if omitted, starts local client console
 -client-addr    local client console address, default 127.0.0.1:18080
 -client-config  local client config path, default ~/.xcloud/client-config.json
@@ -143,8 +180,23 @@ The `/admin` console supports:
 - Space creation and enable/disable;
 - device-level xcloud storage-root configuration;
 - account-level sync trigger settings;
+- server public domain, port, and data directory configuration for admins;
 - sync records for uploads, downloads, deletes, conflicts, skips, and failures;
 - cloud trash with 10-day retention and restore.
+
+## Reconnect Behavior
+
+The client uses HTTP polling plus filesystem watching rather than a permanent
+socket connection. Each sync API call is retried with exponential backoff for
+temporary network errors, timeouts, HTTP `429`, and `5xx` responses. Permanent
+client-side errors such as `400`, `401`, `403`, and `404` fail fast.
+
+When all retry attempts are exhausted, the current sync pass fails but the
+client process does not exit. Realtime watching continues when available, and
+the fallback scan interval keeps running. Once the server is reachable again,
+the client continues pulling server events from the last saved sequence and
+rescans local `xcloud/<space-id>` directories, so offline edits, creates, and
+deletes are picked up in the next successful pass.
 
 ## Security Notes
 
