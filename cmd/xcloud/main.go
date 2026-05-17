@@ -150,7 +150,9 @@ func usage() {
 
 Usage:
   xcloud server -addr :8080 -data ./xcloud-data
+  mkdir -p ./xcloud
   xcloud client -server http://127.0.0.1:8080
+  mkdir -p ./docs
   xcloud client -root ./docs -server http://127.0.0.1:8080 -token account-token -space default
 
 Commands:

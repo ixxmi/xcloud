@@ -1060,7 +1060,7 @@ const dashboardHTML = `<!doctype html>
           <section class="panel" style="margin-top:18px">
             <h2>客户端命令</h2>
             <p class="muted">客户端首次启动无需 token。打开本机客户端页面登录云端账号并开启同步后，客户端会上报根级目录，网关选择目录前不会上传或下载文件。</p>
-            <div class="cmd">./xcloud client -server http://127.0.0.1:8080</div>
+            <div class="cmd">mkdir -p ./xcloud && ./xcloud client -server http://127.0.0.1:8080</div>
             <p class="muted">默认保存根目录是客户端进程启动目录下的 xcloud，可在“客户端保存目录”里按设备修改。</p>
           </section>
         </section>

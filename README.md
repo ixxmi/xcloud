@@ -50,6 +50,7 @@ from the same page.
 First start a client without a token:
 
 ```sh
+mkdir -p ./xcloud
 ./xcloud client -server http://127.0.0.1:8080
 ```
 
@@ -98,6 +99,7 @@ folders selected into another Space do not see these files.
 For a single sync cycle:
 
 ```sh
+mkdir -p /tmp/xcloud-a
 ./xcloud client -root /tmp/xcloud-a -server http://127.0.0.1:8080 -token <account-token> -space default -device laptop-a -once
 ```
 
