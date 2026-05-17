@@ -711,12 +711,14 @@ func (s *Server) renderDashboard(w http.ResponseWriter, account syncmodel.Accoun
 		HasLoading bool
 	}
 	type spaceGroup struct {
-		Account  syncmodel.Account
-		Spaces   []syncmodel.SpaceSummary
-		Folders  []folderView
-		Devices  []syncmodel.ClientDevice
-		Records  []syncmodel.SyncRecord
-		Settings syncmodel.SyncSettings
+		Account           syncmodel.Account
+		Spaces            []syncmodel.SpaceSummary
+		Folders           []folderView
+		Devices           []syncmodel.ClientDevice
+		HasDuplicateNames bool
+		DuplicateNames    []string
+		Records           []syncmodel.SyncRecord
+		Settings          syncmodel.SyncSettings
 	}
 	buildFolderViews := func(folders []syncmodel.ClientFolder, spaces []syncmodel.SpaceSummary) []folderView {
 		treeKey := func(deviceID, rootPath string) string {
@@ -793,7 +795,23 @@ func (s *Server) renderDashboard(w http.ResponseWriter, account syncmodel.Accoun
 	for _, item := range accounts {
 		spaces := s.store.ListSpaces(item.ID)
 		folders := s.store.ListFolders(item.ID)
+		devices := s.store.ListClientDevices(item.ID)
 		folderViews := buildFolderViews(folders, spaces)
+		deviceNames := map[string]int{}
+		for _, device := range devices {
+			name := strings.TrimSpace(device.Hostname)
+			if name == "" {
+				name = device.DeviceID
+			}
+			deviceNames[name]++
+		}
+		duplicateNames := []string{}
+		for name, count := range deviceNames {
+			if count > 1 {
+				duplicateNames = append(duplicateNames, name)
+			}
+		}
+		sort.Strings(duplicateNames)
 		for _, summary := range spaces {
 			totalSpaces++
 			totalFiles += summary.FileCount
@@ -803,12 +821,14 @@ func (s *Server) renderDashboard(w http.ResponseWriter, account syncmodel.Accoun
 			}
 		}
 		groups = append(groups, spaceGroup{
-			Account:  item,
-			Spaces:   spaces,
-			Folders:  folderViews,
-			Devices:  s.store.ListClientDevices(item.ID),
-			Records:  s.store.ListSyncRecords(item.ID, 120),
-			Settings: syncmodel.NormalizeSyncSettings(item.SyncSettings),
+			Account:           item,
+			Spaces:            spaces,
+			Folders:           folderViews,
+			Devices:           devices,
+			HasDuplicateNames: len(duplicateNames) > 0,
+			DuplicateNames:    duplicateNames,
+			Records:           s.store.ListSyncRecords(item.ID, 120),
+			Settings:          syncmodel.NormalizeSyncSettings(item.SyncSettings),
 		})
 	}
 	page := template.Must(template.New("dashboard").Funcs(template.FuncMap{
@@ -1004,8 +1024,8 @@ const dashboardHTML = `<!doctype html>
     .nav{padding:20px 14px;flex:1}.nav p{font-size:12px;text-transform:uppercase;letter-spacing:.6px;font-family:figmaMono,"SF Mono",Menlo,monospace;margin:10px 12px 14px}.nav button{width:100%;height:44px;display:flex;align-items:center;gap:10px;padding:0 14px;border-radius:9999px;color:var(--ink);font-size:16px;margin:6px 0;background:transparent;border:0;font-weight:480;cursor:pointer;text-align:left}.nav button.active{background:var(--ink);color:var(--canvas)}.nav button:not(.active):hover{background:var(--soft)}.logout{padding:18px;border-top:1px solid var(--hair)}.logout button{width:100%;height:42px;border:1px solid var(--ink);border-radius:9999px;background:var(--canvas);color:var(--ink);font-weight:480;cursor:pointer}
     .main{margin-left:268px;min-width:0;flex:1}.top{height:72px;background:var(--canvas);border-bottom:1px solid var(--hair);display:flex;align-items:center;justify-content:space-between;padding:0 32px;position:sticky;top:0;z-index:5}.top-left{display:flex;align-items:center;gap:14px;min-width:0}.menu-toggle{display:none;width:42px;height:42px;padding:0;align-items:center;justify-content:center}.search{height:42px;width:min(420px,48vw);display:flex;align-items:center;gap:8px;background:var(--soft);border:1px solid var(--hair);border-radius:9999px;padding:0 16px}.search input{border:0;background:transparent;outline:none;width:100%;font-size:16px}.user{display:flex;align-items:center;gap:12px}.avatar{width:38px;height:38px;border-radius:9999px;background:var(--lilac);color:var(--ink);display:flex;align-items:center;justify-content:center;font-weight:700;border:1px solid var(--ink)}.content{padding:32px;max-width:1320px;margin:0 auto}.hero{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:24px;padding:48px;border-radius:24px;background:var(--lime)}.hero h1{font-size:64px;line-height:1;margin:0 0 14px;letter-spacing:0;font-weight:340}.muted{color:var(--ink);font-size:16px;line-height:1.45;font-weight:330}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.stat{border:1px solid var(--ink);border-radius:24px;padding:22px;background:var(--canvas)}.stat:nth-child(2){background:var(--cream)}.stat:nth-child(3){background:var(--mint)}.stat:nth-child(4){background:var(--pink)}.stat .label{font-size:12px;text-transform:uppercase;letter-spacing:.6px;font-family:figmaMono,"SF Mono",Menlo,monospace;margin-bottom:10px}.stat strong{font-size:36px;font-weight:540}.stat .hint{font-size:13px;margin-top:10px}
     .two{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.8fr);gap:18px;margin-top:18px}.panel{background:var(--canvas);border:1px solid var(--hair);border-radius:24px;padding:24px;margin-bottom:18px}.panel:nth-child(2n){background:var(--cream)}.panel h2{font-size:26px;margin:0 0 14px;font-weight:540}.panel h3{font-size:20px;margin:20px 0 10px}.flash{border-radius:8px;padding:14px 16px;margin-bottom:18px;word-break:break-all;font-size:15px;border:1px solid var(--ink)}.flash.success{background:var(--mint)}.flash.error{background:var(--pink)}
-    .folder-list{border:1px solid var(--ink);border-radius:24px;background:var(--canvas);overflow:auto;max-height:560px}.folder-node{position:relative;background:var(--canvas);border-bottom:1px solid var(--hair)}.folder-node:last-child{border-bottom:0}.folder-node.selected{background:var(--lime)}.folder-node.disabled{opacity:.58}.folder-node.loading{background:var(--cream)}.folder-node.collapsed-child{display:none}.folder-row{display:grid;grid-template-columns:minmax(0,1fr) max-content;gap:12px;align-items:center;min-height:56px;padding:9px 12px;transition:background .16s}.folder-row:hover{background:var(--soft)}.folder-left{display:flex;align-items:center;gap:10px;min-width:0}.tree-indent{width:var(--indent);flex:0 0 var(--indent);height:1px}.branch{width:18px;height:28px;border-left:1px solid var(--ink);border-bottom:1px solid var(--ink);border-bottom-left-radius:8px;flex:0 0 18px}.folder-node.root .branch{border-color:transparent;width:0;flex-basis:0}.folder-icon{width:28px;height:28px;border-radius:9999px;background:var(--canvas);border:1px solid var(--ink);display:flex;align-items:center;justify-content:center;font-size:12px;flex:0 0 28px}.folder-copy{min-width:0}.folder-title{display:flex;align-items:center;gap:7px;min-width:0;flex-wrap:wrap}.folder-title strong{font-size:16px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px}.folder-path{font-size:12px;line-height:1.35;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:min(680px,50vw)}.folder-meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.folder-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;white-space:nowrap}.folder-actions form{margin:0}.folder-actions button,.folder-actions select{height:34px;padding:7px 12px;font-size:13px}.folder-actions select{width:130px}.select-form{display:flex;align-items:center;gap:6px}.mini{font-size:12px;line-height:1.35}.warn{background:var(--coral);color:var(--ink)}.loading-row{display:flex;align-items:center;gap:10px;padding:0 12px 10px;color:var(--ink);font-size:13px}.spinner{width:14px;height:14px;border:2px solid var(--ink);border-right-color:transparent;border-radius:9999px;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.empty-tree{padding:18px}
-    .device-list{display:grid;gap:10px}.device-card{border:1px solid var(--ink);border-radius:8px;background:var(--canvas);padding:14px}.device-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.device-title{min-width:0}.device-title strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.device-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end}.device-form button{height:42px}.device-meta{font-size:12px;line-height:1.4;margin-top:6px;word-break:break-all}
+    .folder-list{border:1px solid var(--ink);border-radius:24px;background:var(--canvas);overflow:auto;max-height:560px}.folder-node{position:relative;background:var(--canvas);border-bottom:1px solid var(--hair)}.folder-node:last-child{border-bottom:0}.folder-node.selected{background:var(--lime)}.folder-node.disabled{opacity:.58}.folder-node.loading{background:var(--cream)}.folder-node.collapsed-child,.folder-node.device-hidden{display:none}.folder-row{display:grid;grid-template-columns:minmax(0,1fr) max-content;gap:12px;align-items:center;min-height:56px;padding:9px 12px;transition:background .16s}.folder-row:hover{background:var(--soft)}.folder-left{display:flex;align-items:center;gap:10px;min-width:0}.tree-indent{width:var(--indent);flex:0 0 var(--indent);height:1px}.branch{width:18px;height:28px;border-left:1px solid var(--ink);border-bottom:1px solid var(--ink);border-bottom-left-radius:8px;flex:0 0 18px}.folder-node.root .branch{border-color:transparent;width:0;flex-basis:0}.folder-icon{width:28px;height:28px;border-radius:9999px;background:var(--canvas);border:1px solid var(--ink);display:flex;align-items:center;justify-content:center;font-size:12px;flex:0 0 28px}.folder-copy{min-width:0}.folder-title{display:flex;align-items:center;gap:7px;min-width:0;flex-wrap:wrap}.folder-title strong{font-size:16px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px}.folder-path{font-size:12px;line-height:1.35;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:min(680px,50vw)}.folder-meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.folder-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;white-space:nowrap}.folder-actions form{margin:0}.folder-actions button,.folder-actions select{height:34px;padding:7px 12px;font-size:13px}.folder-actions select{width:130px}.select-form{display:flex;align-items:center;gap:6px}.mini{font-size:12px;line-height:1.35}.warn{background:var(--coral);color:var(--ink)}.loading-row{display:flex;align-items:center;gap:10px;padding:0 12px 10px;color:var(--ink);font-size:13px}.spinner{width:14px;height:14px;border:2px solid var(--ink);border-right-color:transparent;border-radius:9999px;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.empty-tree{padding:18px}
+    .device-filter{display:flex;align-items:end;gap:12px;margin:14px 0}.device-filter label{margin:0}.device-filter select{max-width:320px}.duplicate-alert{border:1px solid var(--ink);border-radius:8px;background:var(--coral);padding:10px 12px;margin:10px 0;font-size:13px;line-height:1.45}.device-list{display:grid;gap:10px}.device-card{border:1px solid var(--ink);border-radius:8px;background:var(--canvas);padding:14px}.device-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.device-title{min-width:0}.device-title strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.device-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end}.device-form button{height:42px}.device-meta{font-size:12px;line-height:1.4;margin-top:6px;word-break:break-all}
     .record-list{display:grid;gap:8px}.record-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--hair);border-radius:8px;padding:12px;background:var(--canvas)}.record-main{min-width:0}.record-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.record-path{font-size:12px;word-break:break-all;margin-top:4px}.record-meta{font-size:12px;margin-top:5px}.record-side{text-align:right;font-size:12px;min-width:160px}
     table{width:100%;border-collapse:collapse;font-size:15px}th,td{border-bottom:1px solid var(--hair);text-align:left;padding:12px 8px;vertical-align:top}th{font-size:12px;text-transform:uppercase;letter-spacing:.6px;font-family:figmaMono,"SF Mono",Menlo,monospace}code,.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.cmd{background:var(--inverse);color:var(--inverse-ink);border-radius:8px;padding:14px;word-break:break-all}
     label{display:block;font-size:12px;font-weight:400;margin:12px 0 6px;font-family:figmaMono,"SF Mono",Menlo,monospace;text-transform:uppercase;letter-spacing:.6px}input,textarea,select{box-sizing:border-box;width:100%;border:1px solid var(--hair);border-radius:8px;padding:11px 12px;font-size:16px;background:var(--canvas);color:var(--ink)}input:focus,textarea:focus,select:focus{outline:none;border-color:var(--ink);box-shadow:0 0 0 3px var(--lime)}textarea{min-height:78px;resize:vertical}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.inline{display:inline}
@@ -1075,6 +1095,18 @@ const dashboardHTML = `<!doctype html>
                   <h2>{{.Account.Username}} 的客户端目录</h2>
                   <p class="muted">客户端上报的本地目录会先进入待选择状态。选择到某个 Space 后，同账号同 Space 的目录开始互相同步。</p>
                 </div>
+              </div>
+              {{if .HasDuplicateNames}}
+              <div class="duplicate-alert">检测到客户端名称重复：{{range .DuplicateNames}}<code>{{.}}</code> {{end}}。建议启动客户端时使用 <code>-device</code> 指定唯一名称，或调整主机名/客户端配置后重新登录。</div>
+              {{end}}
+              <div class="device-filter">
+                <div>
+                  <label>当前客户端</label>
+                  <select data-device-select>
+                    {{range .Devices}}<option value="{{.DeviceID}}">{{if .Hostname}}{{.Hostname}} / {{end}}{{.DeviceID}}</option>{{end}}
+                  </select>
+                </div>
+                <span class="muted mini">默认展示第一个客户端；切换后只显示该客户端上报的目录。</span>
               </div>
               <div class="folder-list">
                 {{range .Folders}}
@@ -1356,6 +1388,17 @@ const dashboardHTML = `<!doctype html>
       if (menuClose) menuClose.addEventListener("click", closeMenu);
       buttons.forEach(function(button){ button.addEventListener("click", function(){ show(button.getAttribute("data-view-target")); }); });
       var nodes = Array.prototype.slice.call(document.querySelectorAll(".folder-node"));
+      function applyDeviceFilter(select){
+        var panel = select.closest(".panel");
+        var selected = select.value;
+        Array.prototype.slice.call(panel.querySelectorAll(".folder-node")).forEach(function(node){
+          node.classList.toggle("device-hidden", selected && node.getAttribute("data-device-id") !== selected);
+        });
+      }
+      document.querySelectorAll("[data-device-select]").forEach(function(select){
+        select.addEventListener("change", function(){ applyDeviceFilter(select); });
+        applyDeviceFilter(select);
+      });
       function childNodes(parent){
         return nodes.filter(function(node){
           return node.getAttribute("data-device-id") === parent.getAttribute("data-device-id") &&

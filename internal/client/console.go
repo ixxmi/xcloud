@@ -52,13 +52,6 @@ func NewConsole(cfg ConsoleConfig) (*Console, error) {
 	if cfg.SpaceID == "" {
 		cfg.SpaceID = "default"
 	}
-	if cfg.DeviceID == "" {
-		host, _ := os.Hostname()
-		if host == "" {
-			host = "device"
-		}
-		cfg.DeviceID = host
-	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = 10 * time.Second
 	}
@@ -81,12 +74,15 @@ func NewConsole(cfg ConsoleConfig) (*Console, error) {
 	if local.SpaceID == "" {
 		local.SpaceID = cfg.SpaceID
 	}
-	if local.DeviceID == "" {
-		local.DeviceID = cfg.DeviceID
-	}
 	if local.StorageRoot == "" {
 		local.StorageRoot = defaultStorageRoot(cfg.Root)
 	}
+	effectiveDeviceID := strings.TrimSpace(cfg.DeviceID)
+	if effectiveDeviceID == "" {
+		effectiveDeviceID = local.DeviceID
+	}
+	cfg.DeviceID = defaultDeviceID(effectiveDeviceID, defaultDiscoveryRoot(cfg.Root), local.StorageRoot, local.ServerURL)
+	local.DeviceID = cfg.DeviceID
 	local.SyncSettings = syncmodel.NormalizeSyncSettings(local.SyncSettings)
 	local.DeleteRemote = local.DeleteRemote || cfg.DeleteRemote
 	return &Console{cfg: cfg, log: cfg.Log, local: local}, nil
@@ -467,6 +463,20 @@ type clientConsoleData struct {
 }
 
 func defaultStorageRoot(root string) string {
+	if strings.TrimSpace(root) != "" {
+		if abs, err := filepath.Abs(root); err == nil {
+			return abs
+		}
+		return root
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "xcloud"
+	}
+	return filepath.Join(cwd, "xcloud")
+}
+
+func defaultDiscoveryRoot(root string) string {
 	if strings.TrimSpace(root) != "" {
 		if abs, err := filepath.Abs(root); err == nil {
 			return abs

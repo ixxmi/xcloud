@@ -79,13 +79,6 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if cfg.SpaceID == "" {
 		cfg.SpaceID = "default"
 	}
-	if cfg.DeviceID == "" {
-		host, _ := os.Hostname()
-		if host == "" {
-			host = "device"
-		}
-		cfg.DeviceID = host
-	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = 10 * time.Second
 	}
@@ -115,6 +108,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if cfg.LocalRoot == "" {
 		cfg.LocalRoot = localRootFor(cfg.StorageRoot, cfg.Root, cfg.SpaceID)
 	}
+	cfg.DeviceID = defaultDeviceID(cfg.DeviceID, cfg.Root, cfg.StorageRoot, cfg.ServerURL)
 	localRootAbs, err := filepath.Abs(cfg.LocalRoot)
 	if err != nil {
 		return nil, err
@@ -147,13 +141,6 @@ func NewSupervisor(cfg Config) (*Supervisor, error) {
 	}
 	if cfg.SpaceID == "" {
 		cfg.SpaceID = "default"
-	}
-	if cfg.DeviceID == "" {
-		host, _ := os.Hostname()
-		if host == "" {
-			host = "device"
-		}
-		cfg.DeviceID = host
 	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = 10 * time.Second
@@ -188,6 +175,7 @@ func NewSupervisor(cfg Config) (*Supervisor, error) {
 	if err := os.MkdirAll(cfg.StorageRoot, 0o755); err != nil {
 		return nil, err
 	}
+	cfg.DeviceID = defaultDeviceID(cfg.DeviceID, cfg.Root, cfg.StorageRoot, cfg.ServerURL)
 	if cfg.StatePath == "" {
 		cfg.StatePath = filepath.Join(clientStateRoot(), ".xcloud", "discovery-state.json")
 	}
@@ -1139,6 +1127,19 @@ func localRootFor(storageRoot, root, spaceID string) string {
 		base = "root"
 	}
 	return filepath.Join(storageRoot, safeStateName(spaceID), hex.EncodeToString(sum[:])[:12]+"-"+base)
+}
+
+func defaultDeviceID(deviceID, root, storageRoot, serverURL string) string {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID != "" {
+		return deviceID
+	}
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "device"
+	}
+	sum := sha256.Sum256([]byte(serverURL + "\x00" + root + "\x00" + storageRoot))
+	return safeStateName(host) + "-" + hex.EncodeToString(sum[:])[:8]
 }
 
 func discoverRootFolders() ([]string, error) {
