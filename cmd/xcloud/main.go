@@ -61,9 +61,29 @@ func runServer(args []string, log *slog.Logger) error {
 	if *data != "" {
 		runtimeConfig.DataDir = *data
 	}
+	if err := server.WriteRuntimeConfigFile(runtimeConfig); err != nil {
+		return err
+	}
 	runtimeConfig.Normalize()
 	store, err := server.NewStore(runtimeConfig.DataDir)
 	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+	runtimeConfig, err = store.RuntimeConfig(runtimeConfig)
+	if err != nil {
+		return err
+	}
+	runtimeConfig.DataDir = store.Root()
+	if *addr != "" {
+		if err := runtimeConfig.ApplyListenAddr(*addr); err != nil {
+			return err
+		}
+	}
+	if *data != "" {
+		runtimeConfig.DataDir = *data
+	}
+	if err := store.SaveRuntimeConfig(runtimeConfig); err != nil {
 		return err
 	}
 	srv := &http.Server{

@@ -56,6 +56,19 @@ func LoadRuntimeConfig(path string) (RuntimeConfig, error) {
 
 func SaveRuntimeConfig(cfg RuntimeConfig) error {
 	cfg.Normalize()
+	if err := WriteRuntimeConfigFile(cfg); err != nil {
+		return err
+	}
+	db, err := openSQLite(filepath.Join(cfg.DataDir, "server.db"))
+	if err != nil {
+		return err
+	}
+	defer closeSQLite(db)
+	return saveRuntimeConfigToSQLite(db, cfg)
+}
+
+func WriteRuntimeConfigFile(cfg RuntimeConfig) error {
+	cfg.Normalize()
 	if strings.TrimSpace(cfg.Path) == "" {
 		cfg.Path = DefaultRuntimeConfigPath
 	}

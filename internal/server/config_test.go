@@ -29,7 +29,7 @@ func TestRuntimeConfigSaveLoadAndListenOverride(t *testing.T) {
 	cfg := RuntimeConfig{
 		Path:    path,
 		Domain:  "example.com:19000",
-		DataDir: "data",
+		DataDir: filepath.Join(t.TempDir(), "data"),
 	}
 	cfg.Normalize()
 	if cfg.Domain != "example.com" || cfg.Port != 19000 {
@@ -51,7 +51,7 @@ func TestRuntimeConfigSaveLoadAndListenOverride(t *testing.T) {
 	if loaded.Path != path {
 		t.Fatalf("Path = %q, want %q", loaded.Path, path)
 	}
-	if loaded.Domain != "example.com" || loaded.Port != 18003 || loaded.DataDir != "data" || loaded.ListenHost != "127.0.0.1" {
+	if loaded.Domain != "example.com" || loaded.Port != 18003 || loaded.DataDir != cfg.DataDir || loaded.ListenHost != "127.0.0.1" {
 		t.Fatalf("loaded = %+v", loaded)
 	}
 }

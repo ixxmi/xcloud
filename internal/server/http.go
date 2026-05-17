@@ -583,7 +583,11 @@ func (s *Server) adminUpdateServerConfig(w http.ResponseWriter, r *http.Request,
 	cfg.ListenHost = r.Form.Get("listen_host")
 	cfg.Normalize()
 	cfg.Path = s.runtimeConfig.Path
-	if err := SaveRuntimeConfig(cfg); err != nil {
+	if err := WriteRuntimeConfigFile(cfg); err != nil {
+		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "server"})
+		return
+	}
+	if err := s.store.SaveRuntimeConfig(cfg); err != nil {
 		s.renderDashboard(w, account, flashMessage{Kind: "error", Text: err.Error()}, dashboardOptions{View: "server"})
 		return
 	}

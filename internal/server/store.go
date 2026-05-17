@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -31,15 +32,21 @@ type Store struct {
 	root      string
 	state     syncmodel.ServerState
 	statePath string
+	db        *sql.DB
 }
 
 func NewStore(root string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Join(root, "chunks"), 0o755); err != nil {
 		return nil, err
 	}
+	db, err := openSQLite(filepath.Join(root, "server.db"))
+	if err != nil {
+		return nil, err
+	}
 	s := &Store{
 		root:      root,
 		statePath: filepath.Join(root, "metadata.json"),
+		db:        db,
 		state: syncmodel.ServerState{
 			Accounts:      map[string]*syncmodel.Account{},
 			ClientTokens:  map[string]*syncmodel.ClientToken{},
@@ -55,9 +62,19 @@ func NewStore(root string) (*Store, error) {
 		},
 	}
 	if err := s.load(); err != nil {
+		closeSQLite(db)
+		return nil, err
+	}
+	if err := s.loadControlFromSQLite(); err != nil {
+		closeSQLite(db)
 		return nil, err
 	}
 	if err := s.ensureBootstrap(); err != nil {
+		closeSQLite(db)
+		return nil, err
+	}
+	if err := s.saveControlLocked(); err != nil {
+		closeSQLite(db)
 		return nil, err
 	}
 	return s, nil
@@ -65,6 +82,32 @@ func NewStore(root string) (*Store, error) {
 
 func (s *Store) Root() string {
 	return s.root
+}
+
+func (s *Store) Close() error {
+	if s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
+func (s *Store) RuntimeConfig(fallback RuntimeConfig) (RuntimeConfig, error) {
+	if s.db == nil {
+		return fallback, nil
+	}
+	cfg, err := loadRuntimeConfigFromSQLite(s.db, fallback)
+	if err != nil {
+		return fallback, err
+	}
+	cfg.Path = fallback.Path
+	return cfg, nil
+}
+
+func (s *Store) SaveRuntimeConfig(cfg RuntimeConfig) error {
+	if s.db == nil {
+		return nil
+	}
+	return saveRuntimeConfigToSQLite(s.db, cfg)
 }
 
 func (s *Store) load() error {
@@ -115,6 +158,20 @@ func (s *Store) load() error {
 		s.state.Operations = map[string]syncmodel.CommitResponse{}
 	}
 	return nil
+}
+
+func (s *Store) loadControlFromSQLite() error {
+	if s.db == nil {
+		return nil
+	}
+	hasData, err := sqliteHasControlData(s.db)
+	if err != nil {
+		return err
+	}
+	if !hasData {
+		return nil
+	}
+	return loadControlStateFromSQLite(s.db, &s.state)
 }
 
 func (s *Store) ensureBootstrap() error {
@@ -347,10 +404,20 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return fileutil.AtomicWrite(s.statePath, func(f *os.File) error {
+	if err := fileutil.AtomicWrite(s.statePath, func(f *os.File) error {
 		_, err := f.Write(b)
 		return err
-	})
+	}); err != nil {
+		return err
+	}
+	return s.saveControlLocked()
+}
+
+func (s *Store) saveControlLocked() error {
+	if s.db == nil {
+		return nil
+	}
+	return saveControlStateToSQLite(s.db, s.state)
 }
 
 func HashSecret(secret string) string {

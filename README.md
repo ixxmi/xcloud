@@ -54,7 +54,9 @@ http://ixxmi.com:18002/admin
 ```
 
 The server stores metadata in `server-data/metadata.json` and chunks under
-`server-data/chunks`.
+`server-data/chunks`. Control-plane data is also mirrored into SQLite at
+`server-data/server.db`: server config, accounts, client tokens, devices,
+Spaces, and sync settings.
 
 Server defaults are loaded from `xcloud-server.json`:
 
